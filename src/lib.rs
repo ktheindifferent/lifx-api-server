@@ -22,7 +22,7 @@ use rouille::post_input;
 
 use serde::{Serialize, Deserialize};
 
-use palette::FromColor;
+use palette::{Hsv, Srgb, IntoColor};
 
 use colors_transform::{Rgb, Color};
 
@@ -640,8 +640,6 @@ pub fn start(config: Config) {
                     // }
             
                     mgr.refresh();
-                    std::mem::drop(mgr);
-                    std::mem::drop(lock);
                     thread::sleep(Duration::from_millis(1000));
                 }
         
@@ -725,12 +723,167 @@ pub fn start(config: Config) {
         
         
                     // (PUT) SetStates
-                    // TODO - Implement
                     // https://api.lifx.com/v1/lights/states
-                    if request.url().contains("/lights/states"){
-                        // std::mem::drop(bulbs);
-                        // std::mem::drop(mgr);
-                        // std::mem::drop(lock);
+                    if request.url().contains("/lights/states") && request.method() == "PUT" {
+                        #[derive(Deserialize)]
+                        struct StateUpdate {
+                            selector: String,
+                            power: Option<String>,
+                            color: Option<String>,
+                            brightness: Option<f64>,
+                            duration: Option<f64>,
+                            infrared: Option<f64>,
+                            fast: Option<bool>,
+                        }
+
+                        #[derive(Deserialize)]
+                        struct StatesRequest {
+                            states: Vec<StateUpdate>,
+                            defaults: Option<StateUpdate>,
+                        }
+
+                        #[derive(Serialize)]
+                        struct StateResult {
+                            id: String,
+                            label: String,
+                            status: String,
+                        }
+
+                        #[derive(Serialize)]
+                        struct StatesResponse {
+                            results: Vec<StateResult>,
+                        }
+
+                        let body = try_or_400!(rouille::input::plain_text_body(request));
+                        let input: StatesRequest = try_or_400!(serde_json::from_str(&body));
+                        let mut results = Vec::new();
+
+                        for state_update in input.states {
+                            // Filter bulbs based on selector
+                            let mut filtered_bulbs: Vec<&BulbInfo> = Vec::new();
+                            
+                            for bulb in bulbs.values() {
+                                let mut matches = false;
+                                
+                                if state_update.selector == "all" {
+                                    matches = true;
+                                } else if state_update.selector.starts_with("id:") {
+                                    let id = state_update.selector.strip_prefix("id:").unwrap_or("");
+                                    matches = bulb.id.contains(id);
+                                } else if state_update.selector.starts_with("group_id:") {
+                                    let group_id = state_update.selector.strip_prefix("group_id:").unwrap_or("");
+                                    matches = bulb.lifx_group.as_ref().map_or(false, |g| g.id.contains(group_id));
+                                } else if state_update.selector.starts_with("location_id:") {
+                                    let location_id = state_update.selector.strip_prefix("location_id:").unwrap_or("");
+                                    matches = bulb.lifx_location.as_ref().map_or(false, |l| l.id.contains(location_id));
+                                } else if state_update.selector.starts_with("label:") {
+                                    let label = state_update.selector.strip_prefix("label:").unwrap_or("");
+                                    matches = bulb.label.contains(label);
+                                }
+                                
+                                if matches {
+                                    filtered_bulbs.push(bulb);
+                                }
+                            }
+
+                            // Apply state changes to filtered bulbs
+                            for bulb in filtered_bulbs {
+                                let mut status = "ok";
+                                
+                                // Apply power state
+                                if let Some(ref power) = state_update.power {
+                                    let result = if power == "on" {
+                                        bulb.set_power(&mgr.sock, PowerLevel::Enabled)
+                                    } else {
+                                        bulb.set_power(&mgr.sock, PowerLevel::Standby)
+                                    };
+                                    
+                                    if result.is_err() {
+                                        status = "error";
+                                    }
+                                }
+                                
+                                // Apply color if specified
+                                if let Some(ref color_str) = state_update.color {
+                                    // Reuse existing color parsing logic
+                                    let mut kelvin = bulb.lifx_color.as_ref().map_or(6500, |c| c.kelvin);
+                                    let mut brightness = bulb.lifx_color.as_ref().map_or(65535, |c| c.brightness);
+                                    let mut saturation = bulb.lifx_color.as_ref().map_or(0, |c| c.saturation);
+                                    let mut hue = bulb.lifx_color.as_ref().map_or(0, |c| c.hue);
+                                    let duration = state_update.duration.unwrap_or(0.0) as u32;
+                                    
+                                    // Parse color string and update HSBK values
+                                    let hsbk = if color_str.starts_with("kelvin:") {
+                                        let k = color_str.strip_prefix("kelvin:").unwrap_or("6500").parse::<u16>().unwrap_or(6500);
+                                        HSBK { hue, saturation: 0, brightness, kelvin: k }
+                                    } else if color_str.starts_with("hue:") {
+                                        let h = color_str.strip_prefix("hue:").unwrap_or("0").parse::<u16>().unwrap_or(0);
+                                        HSBK { hue: h, saturation, brightness, kelvin }
+                                    } else if color_str.starts_with("brightness:") {
+                                        let b = color_str.strip_prefix("brightness:").unwrap_or("1.0").parse::<f64>().unwrap_or(1.0);
+                                        HSBK { hue, saturation, brightness: (b * 65535.0) as u16, kelvin }
+                                    } else if color_str.starts_with("saturation:") {
+                                        let s = color_str.strip_prefix("saturation:").unwrap_or("1.0").parse::<f64>().unwrap_or(1.0);
+                                        HSBK { hue, saturation: (s * 65535.0) as u16, brightness, kelvin }
+                                    } else {
+                                        // Handle named colors
+                                        match color_str.as_str() {
+                                            "white" => HSBK { hue: 0, saturation: 0, brightness, kelvin },
+                                            "red" => HSBK { hue: 0, saturation: 65535, brightness, kelvin },
+                                            "orange" => HSBK { hue: 7098, saturation: 65535, brightness, kelvin },
+                                            "yellow" => HSBK { hue: 10920, saturation: 65535, brightness, kelvin },
+                                            "cyan" => HSBK { hue: 32760, saturation: 65535, brightness, kelvin },
+                                            "green" => HSBK { hue: 21840, saturation: 65535, brightness, kelvin },
+                                            "blue" => HSBK { hue: 43680, saturation: 65535, brightness, kelvin },
+                                            "purple" => HSBK { hue: 50050, saturation: 65535, brightness, kelvin },
+                                            "pink" => HSBK { hue: 63700, saturation: 25000, brightness, kelvin },
+                                            _ => HSBK { hue, saturation, brightness, kelvin }
+                                        }
+                                    };
+                                    
+                                    if bulb.set_color(&mgr.sock, hsbk, duration).is_err() {
+                                        status = "error";
+                                    }
+                                }
+                                
+                                // Apply brightness if specified independently
+                                if state_update.color.is_none() && state_update.brightness.is_some() {
+                                    let brightness_val = state_update.brightness.unwrap();
+                                    let duration = state_update.duration.unwrap_or(0.0) as u32;
+                                    
+                                    let mut kelvin = bulb.lifx_color.as_ref().map_or(6500, |c| c.kelvin);
+                                    let mut saturation = bulb.lifx_color.as_ref().map_or(0, |c| c.saturation);
+                                    let mut hue = bulb.lifx_color.as_ref().map_or(0, |c| c.hue);
+                                    
+                                    let hsbk = HSBK {
+                                        hue,
+                                        saturation,
+                                        brightness: (brightness_val * 65535.0) as u16,
+                                        kelvin,
+                                    };
+                                    
+                                    if bulb.set_color(&mgr.sock, hsbk, duration).is_err() {
+                                        status = "error";
+                                    }
+                                }
+                                
+                                // Apply infrared if specified
+                                if let Some(infrared) = state_update.infrared {
+                                    let ir_brightness = (infrared * 65535.0) as u16;
+                                    if bulb.set_infrared(&mgr.sock, ir_brightness).is_err() {
+                                        status = "error";
+                                    }
+                                }
+                                
+                                results.push(StateResult {
+                                    id: bulb.id.clone(),
+                                    label: bulb.label.clone(),
+                                    status: status.to_string(),
+                                });
+                            }
+                        }
+
+                        response = Response::json(&StatesResponse { results });
                     }
         
                     // (PUT) SetState
@@ -955,16 +1108,13 @@ pub fn start(config: Config) {
                                     let blue_int = rgb_parts_vec[2].to_string().parse::<i64>().unwrap(); 
                                     let blue_float: f32 = (blue_int) as f32;
         
-                                    let hcc = palette::Hsv::from_rgb(palette::Rgb{
-                                        red: red_float,
-                                        green: green_float,
-                                        blue: blue_float,
-                                    });
+                                    let rgb = Srgb::new(red_float / 255.0, green_float / 255.0, blue_float / 255.0);
+                                    let hcc: Hsv = rgb.into_color();
         
                                     // TODO: Why does this ugly hack work? Why is lifx api so differ
                                     let hbsk_set = HSBK {
-                                        hue: (hcc.hue.to_positive_degrees() * 182.0) as u16,
-                                        saturation: (hcc.saturation.to_degrees() * 1000.0) as u16,
+                                        hue: (hcc.hue.into_positive_degrees() * 182.0) as u16,
+                                        saturation: (hcc.saturation * 65535.0) as u16,
                                         brightness: brightness,
                                         kelvin: kelvin,
                                     };
@@ -1000,18 +1150,15 @@ pub fn start(config: Config) {
                                     println!("blue_float: {:?}", blue_float);
         
                     
-                                    let hcc = palette::Hsv::from_rgb(palette::Rgb{
-                                        red: red_float,
-                                        green: green_float,
-                                        blue: blue_float,
-                                    });
+                                    let rgb = Srgb::new(red_float / 255.0, green_float / 255.0, blue_float / 255.0);
+                                    let hcc: Hsv = rgb.into_color();
 
                                     println!("hcc: {:?}", hcc);
         
                                     // TODO: Why does this ugly hack work? Why is lifx api so differ
                                     let hbsk_set = HSBK {
-                                        hue: (hcc.hue.to_positive_degrees() * 182.0) as u16,
-                                        saturation: (hcc.saturation.to_degrees() * 1000.0) as u16,
+                                        hue: (hcc.hue.into_positive_degrees() * 182.0) as u16,
+                                        saturation: (hcc.saturation * 65535.0) as u16,
                                         brightness: brightness,
                                         kelvin: kelvin,
                                     };
@@ -1075,21 +1222,29 @@ pub fn start(config: Config) {
                         }
         
         
-                        // std::mem::drop(mgr);
-                        // std::mem::drop(lock);
-                        // TODO - Send Results
-                        // {
-                        //     "results": [
-                        //       {
-                        //         "id": "d3b2f2d97452",
-                        //         "label": "Left Lamp",
-                        //         "status": "ok" // timeout or error
-                        //       }
-                        //     ]
-                        //   }
-        
-        
-                        response = Response::text("done");
+                        // Return results in proper format
+                        #[derive(Serialize)]
+                        struct SingleStateResult {
+                            id: String,
+                            label: String,
+                            status: String,
+                        }
+
+                        #[derive(Serialize)]
+                        struct SingleStateResponse {
+                            results: Vec<SingleStateResult>,
+                        }
+
+                        let mut results = Vec::new();
+                        for bulb in &bulbs_vec {
+                            results.push(SingleStateResult {
+                                id: bulb.id.clone(),
+                                label: bulb.label.clone(),
+                                status: "ok".to_string(),
+                            });
+                        }
+
+                        response = Response::json(&SingleStateResponse { results });
         
                     }
         
@@ -1101,10 +1256,7 @@ pub fn start(config: Config) {
                     }
         
         
-                    // Drop mutex locks
-                    std::mem::drop(bulbs);
-                    std::mem::drop(mgr);
-                    std::mem::drop(lock);
+                    // Mutex locks will be automatically dropped when they go out of scope
         
                     return response;
                 });
@@ -1126,4 +1278,178 @@ pub fn start(config: Config) {
 
 
 
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::{IpAddr, Ipv4Addr};
+
+    #[test]
+    fn test_bulb_info_new() {
+        let source = 0x12345678;
+        let target = 0xABCDEF123456;
+        let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 100)), 56700);
+        
+        let bulb = BulbInfo::new(source, target, addr);
+        
+        assert_eq!(bulb.source, source);
+        assert_eq!(bulb.target, target);
+        assert_eq!(bulb.addr, addr);
+        assert_eq!(bulb.connected, true);
+        assert_eq!(bulb.power, "off");
+        assert_eq!(bulb.brightness, 0.0);
+        assert!(bulb.lifx_color.is_none());
+        assert!(bulb.lifx_group.is_none());
+        assert!(bulb.lifx_location.is_none());
+        assert!(bulb.product.is_none());
+    }
+
+    #[test]
+    fn test_bulb_info_update() {
+        let source = 0x12345678;
+        let target = 0xABCDEF123456;
+        let addr1 = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 100)), 56700);
+        let addr2 = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 101)), 56700);
+        
+        let mut bulb = BulbInfo::new(source, target, addr1);
+        let initial_last_seen = bulb.last_seen;
+        
+        // Sleep briefly to ensure time difference
+        std::thread::sleep(Duration::from_millis(10));
+        
+        bulb.update(addr2);
+        
+        assert_eq!(bulb.addr, addr2);
+        assert!(bulb.last_seen > initial_last_seen);
+    }
+
+    #[test]
+    fn test_refreshable_data_empty() {
+        let data: RefreshableData<String> = RefreshableData::empty(
+            Duration::from_secs(60),
+            Message::GetLabel
+        );
+        
+        assert!(data.data.is_none());
+        assert!(data.needs_refresh());
+        assert!(data.as_ref().is_none());
+    }
+
+    #[test]
+    fn test_refreshable_data_update() {
+        let mut data: RefreshableData<String> = RefreshableData::empty(
+            Duration::from_secs(60),
+            Message::GetLabel
+        );
+        
+        data.update("Test Label".to_string());
+        
+        assert!(data.data.is_some());
+        assert!(!data.needs_refresh());
+        assert_eq!(data.as_ref().unwrap(), "Test Label");
+    }
+
+    #[test]
+    fn test_refreshable_data_expiration() {
+        let mut data: RefreshableData<String> = RefreshableData::empty(
+            Duration::from_millis(10),
+            Message::GetLabel
+        );
+        
+        data.update("Test Label".to_string());
+        assert!(!data.needs_refresh());
+        
+        // Wait for expiration
+        std::thread::sleep(Duration::from_millis(15));
+        assert!(data.needs_refresh());
+    }
+
+    #[test]
+    fn test_lifx_color_creation() {
+        let color = LifxColor {
+            hue: 32768,
+            saturation: 65535,
+            kelvin: 3500,
+            brightness: 32768,
+        };
+        
+        assert_eq!(color.hue, 32768);
+        assert_eq!(color.saturation, 65535);
+        assert_eq!(color.kelvin, 3500);
+        assert_eq!(color.brightness, 32768);
+    }
+
+    #[test]
+    fn test_lifx_group_creation() {
+        let group = LifxGroup {
+            id: "group123".to_string(),
+            name: "Living Room".to_string(),
+        };
+        
+        assert_eq!(group.id, "group123");
+        assert_eq!(group.name, "Living Room");
+    }
+
+    #[test]
+    fn test_lifx_location_creation() {
+        let location = LifxLocation {
+            id: "loc456".to_string(),
+            name: "Home".to_string(),
+        };
+        
+        assert_eq!(location.id, "loc456");
+        assert_eq!(location.name, "Home");
+    }
+
+    #[test]
+    fn test_config_creation() {
+        let config = Config {
+            secret_key: "test_secret".to_string(),
+            port: 8080,
+        };
+        
+        assert_eq!(config.secret_key, "test_secret");
+        assert_eq!(config.port, 8080);
+    }
+
+    // Color conversion helper function tests
+    fn convert_rgb_to_hsbk(red: f32, green: f32, blue: f32) -> (u16, u16) {
+        let rgb = Srgb::new(red / 255.0, green / 255.0, blue / 255.0);
+        let hcc: Hsv = rgb.into_color();
+        
+        let hue = (hcc.hue.into_positive_degrees() * 182.0) as u16;
+        let saturation = (hcc.saturation * 65535.0) as u16;
+        
+        (hue, saturation)
+    }
+
+    #[test]
+    fn test_color_conversion_red() {
+        let (hue, saturation) = convert_rgb_to_hsbk(255.0, 0.0, 0.0);
+        assert_eq!(hue, 0);
+        assert_eq!(saturation, 65535);
+    }
+
+    #[test]
+    fn test_color_conversion_green() {
+        let (hue, saturation) = convert_rgb_to_hsbk(0.0, 255.0, 0.0);
+        // Green is at 120 degrees, which maps to approximately 21845 in LIFX scale
+        assert!((hue as i32 - 21845).abs() < 100);
+        assert_eq!(saturation, 65535);
+    }
+
+    #[test]
+    fn test_color_conversion_blue() {
+        let (hue, saturation) = convert_rgb_to_hsbk(0.0, 0.0, 255.0);
+        // Blue is at 240 degrees, which maps to approximately 43690 in LIFX scale
+        assert!((hue as i32 - 43690).abs() < 100);
+        assert_eq!(saturation, 65535);
+    }
+
+    #[test]
+    fn test_color_conversion_white() {
+        let (_, saturation) = convert_rgb_to_hsbk(255.0, 255.0, 255.0);
+        assert_eq!(saturation, 0); // White has no saturation
+    }
 }
