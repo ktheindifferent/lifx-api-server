@@ -30,6 +30,10 @@ use colors_transform::{Rgb, Color};
 
 const HOUR: Duration = Duration::from_secs(60 * 60);
 
+// Rate limiting configuration
+const MAX_AUTH_ATTEMPTS: u32 = 5;
+const AUTH_WINDOW_SECONDS: u64 = 60;
+
 // LIFX Protocol Color Conversion Constants
 // The LIFX protocol represents HSBK values as 16-bit unsigned integers (0-65535)
 // instead of standard ranges (Hue: 0-360°, Saturation/Brightness: 0-100%)
@@ -53,6 +57,129 @@ const HUE_CYAN: u16 = 32768;   // 180°
 const HUE_BLUE: u16 = 43690;   // 240°
 const HUE_PURPLE: u16 = 50062; // ~275°
 const HUE_PINK: u16 = 63715;   // ~350°
+
+// Simple rate limiter for authentication attempts
+#[derive(Debug, Clone)]
+struct AuthAttempt {
+    timestamp: Instant,
+    count: u32,
+}
+
+struct RateLimiter {
+    attempts: Arc<Mutex<HashMap<String, AuthAttempt>>>,
+}
+
+impl RateLimiter {
+    fn new() -> Self {
+        RateLimiter {
+            attempts: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+
+    fn check_and_update(&self, client_ip: String) -> bool {
+        let mut attempts = self.attempts.lock().unwrap();
+        let now = Instant::now();
+        let window = Duration::from_secs(AUTH_WINDOW_SECONDS);
+        
+        match attempts.get_mut(&client_ip) {
+            Some(attempt) => {
+                if now.duration_since(attempt.timestamp) > window {
+                    // Reset window
+                    attempt.timestamp = now;
+                    attempt.count = 1;
+                    true
+                } else if attempt.count >= MAX_AUTH_ATTEMPTS {
+                    // Too many attempts
+                    false
+                } else {
+                    // Increment counter
+                    attempt.count += 1;
+                    true
+                }
+            }
+            None => {
+                // First attempt
+                attempts.insert(client_ip, AuthAttempt {
+                    timestamp: now,
+                    count: 1,
+                });
+                true
+            }
+        }
+    }
+
+    fn cleanup_old_entries(&self) {
+        let mut attempts = self.attempts.lock().unwrap();
+        let now = Instant::now();
+        let window = Duration::from_secs(AUTH_WINDOW_SECONDS * 2);
+        
+        attempts.retain(|_, attempt| {
+            now.duration_since(attempt.timestamp) <= window
+        });
+    }
+}
+
+// Authentication middleware result
+enum AuthResult {
+    Authorized,
+    Unauthorized(Response),
+}
+
+// Centralized authentication middleware
+fn authenticate_request(
+    request: &rouille::Request,
+    secret_key: &str,
+    rate_limiter: &Arc<RateLimiter>,
+) -> AuthResult {
+    // Extract client IP for rate limiting
+    let client_ip = request.remote_addr().ip().to_string();
+    
+    // Get authorization header
+    let auth_header = request.header("Authorization");
+    
+    match auth_header {
+        None => {
+            // Check rate limit for failed auth attempts
+            if !rate_limiter.check_and_update(client_ip) {
+                return AuthResult::Unauthorized(
+                    Response::text("Too many authentication attempts. Please try again later.")
+                        .with_status_code(429)
+                        .with_additional_header("Retry-After", "60")
+                );
+            }
+            
+            // Return 401 Unauthorized when no auth header is present
+            AuthResult::Unauthorized(
+                Response::text("Unauthorized: Missing Authorization header")
+                    .with_status_code(401)
+                    .with_additional_header("WWW-Authenticate", "Bearer realm=\"LIFX API\"")
+            )
+        }
+        Some(auth_value) => {
+            // Validate the token
+            let expected_token = format!("Bearer {}", secret_key);
+            if auth_value != &expected_token {
+                // Check rate limit for failed auth attempts
+                if !rate_limiter.check_and_update(client_ip) {
+                    return AuthResult::Unauthorized(
+                        Response::text("Too many authentication attempts. Please try again later.")
+                            .with_status_code(429)
+                            .with_additional_header("Retry-After", "60")
+                    );
+                }
+                
+                // Return 401 Unauthorized for invalid token
+                AuthResult::Unauthorized(
+                    Response::text("Unauthorized: Invalid token")
+                        .with_status_code(401)
+                        .with_additional_header("WWW-Authenticate", "Bearer realm=\"LIFX API\"")
+                )
+            } else {
+                AuthResult::Authorized
+            }
+        }
+    }
+}
 
 
 #[derive(Debug)]
@@ -671,18 +798,27 @@ pub fn start(config: Config) {
         
         
             let th2_arc_mgr = Arc::clone(&mgr_arc);
+            
+            // Initialize rate limiter
+            let rate_limiter = Arc::new(RateLimiter::new());
+            
+            // Spawn cleanup thread for rate limiter
+            let cleanup_limiter = Arc::clone(&rate_limiter);
+            thread::spawn(move || {
+                loop {
+                    thread::sleep(Duration::from_secs(120));
+                    cleanup_limiter.cleanup_old_entries();
+                }
+            });
         
             thread::spawn(move || {
                 rouille::start_server(format!("0.0.0.0:{}", config.port).as_str(), move |request| {
         
-        
-                    let auth_header = request.header("Authorization");
-        
-                    if auth_header.is_none(){
-                        return Response::empty_404();
-                    } else {
-                        if auth_header.unwrap().to_string() != format!("Bearer {}", config.secret_key){
-                            return Response::empty_404();
+                    // Use centralized authentication middleware
+                    match authenticate_request(request, &config.secret_key, &rate_limiter) {
+                        AuthResult::Unauthorized(response) => return response,
+                        AuthResult::Authorized => {
+                            // Continue with request processing
                         }
                     }
         
@@ -1475,6 +1611,92 @@ mod tests {
     fn test_color_conversion_white() {
         let (_, saturation) = convert_rgb_to_hsbk(255.0, 255.0, 255.0);
         assert_eq!(saturation, 0); // White has no saturation
+    }
+
+    // Security tests for authentication
+    #[test]
+    fn test_rate_limiter_basic() {
+        let limiter = RateLimiter::new();
+        let client_ip = "192.168.1.1".to_string();
+        
+        // First attempt should succeed
+        assert!(limiter.check_and_update(client_ip.clone()));
+        
+        // Subsequent attempts within limit should succeed
+        for _ in 1..MAX_AUTH_ATTEMPTS {
+            assert!(limiter.check_and_update(client_ip.clone()));
+        }
+        
+        // Exceeding limit should fail
+        assert!(!limiter.check_and_update(client_ip.clone()));
+    }
+
+    #[test]
+    fn test_rate_limiter_window_reset() {
+        let limiter = RateLimiter::new();
+        let client_ip = "192.168.1.2".to_string();
+        
+        // Fill up the attempts
+        for _ in 0..MAX_AUTH_ATTEMPTS {
+            assert!(limiter.check_and_update(client_ip.clone()));
+        }
+        
+        // Should be blocked now
+        assert!(!limiter.check_and_update(client_ip.clone()));
+        
+        // Simulate waiting for window to expire
+        // Note: In a real test, we'd need to mock time or use a configurable duration
+        // For now, we'll test with a different IP
+        let client_ip2 = "192.168.1.3".to_string();
+        assert!(limiter.check_and_update(client_ip2));
+    }
+
+    #[test]
+    fn test_rate_limiter_different_ips() {
+        let limiter = RateLimiter::new();
+        
+        // Different IPs should have independent limits
+        for i in 0..10 {
+            let ip = format!("192.168.1.{}", i);
+            assert!(limiter.check_and_update(ip));
+        }
+    }
+
+    #[test]
+    fn test_rate_limiter_cleanup() {
+        let limiter = RateLimiter::new();
+        
+        // Add some entries
+        for i in 0..5 {
+            let ip = format!("192.168.1.{}", i);
+            limiter.check_and_update(ip);
+        }
+        
+        // Cleanup should not affect recent entries
+        limiter.cleanup_old_entries();
+        
+        // Recent entries should still be tracked
+        let test_ip = "192.168.1.0".to_string();
+        for _ in 1..MAX_AUTH_ATTEMPTS {
+            assert!(limiter.check_and_update(test_ip.clone()));
+        }
+        assert!(!limiter.check_and_update(test_ip));
+    }
+
+    #[test]
+    fn test_auth_result_enum() {
+        // Test that AuthResult can properly hold responses
+        let unauth = AuthResult::Unauthorized(Response::text("test"));
+        match unauth {
+            AuthResult::Unauthorized(_) => assert!(true),
+            AuthResult::Authorized => assert!(false, "Should be unauthorized"),
+        }
+        
+        let auth = AuthResult::Authorized;
+        match auth {
+            AuthResult::Authorized => assert!(true),
+            AuthResult::Unauthorized(_) => assert!(false, "Should be authorized"),
+        }
     }
 
     #[test]
