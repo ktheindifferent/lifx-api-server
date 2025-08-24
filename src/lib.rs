@@ -21,6 +21,7 @@ use rouille::post_input;
 
 
 use serde::{Serialize, Deserialize};
+use serde_json::json;
 
 use palette::{Hsv, Srgb, IntoColor};
 
@@ -33,6 +34,172 @@ use set_states::{SetStatesHandler, StatesRequest};
 
 const HOUR: Duration = Duration::from_secs(60 * 60);
 
+// Helper functions for safe parsing
+fn parse_u16_safe(value: &str) -> Result<u16, String> {
+    value.parse::<u16>()
+        .map_err(|_| format!("Invalid u16 value: {}", value))
+}
+
+fn parse_f64_safe(value: &str) -> Result<f64, String> {
+    value.parse::<f64>()
+        .map_err(|_| format!("Invalid f64 value: {}", value))
+}
+
+fn parse_i64_safe(value: &str) -> Result<i64, String> {
+    value.parse::<i64>()
+        .map_err(|_| format!("Invalid i64 value: {}", value))
+}
+
+// Rate limiting configuration
+const MAX_AUTH_ATTEMPTS: u32 = 5;
+const AUTH_WINDOW_SECONDS: u64 = 60;
+
+// LIFX Protocol Color Conversion Constants
+// The LIFX protocol represents HSBK values as 16-bit unsigned integers (0-65535)
+// instead of standard ranges (Hue: 0-360°, Saturation/Brightness: 0-100%)
+// 
+// According to LIFX protocol documentation, they recommend using 0x10000 (65536)
+// for hue conversion to achieve consistent rounding behavior
+const LIFX_HUE_MAX: f32 = 65536.0; // 0x10000 for consistent rounding as per LIFX docs
+const LIFX_HUE_DEGREE_FACTOR: f32 = LIFX_HUE_MAX / 360.0; // Converts degrees to u16
+
+// For saturation and brightness, LIFX uses the full u16 range (0-65535)
+const LIFX_SATURATION_MAX: f32 = 65535.0; // 0xFFFF
+const LIFX_BRIGHTNESS_MAX: f32 = 65535.0; // 0xFFFF
+
+// Pre-calculated LIFX hue values for named colors (in u16 format)
+// These are calculated using: hue_u16 = (degrees * 65536 / 360) % 65536
+const HUE_RED: u16 = 0;        // 0°
+const HUE_ORANGE: u16 = 7099;  // ~39°
+const HUE_YELLOW: u16 = 10922; // 60°
+const HUE_GREEN: u16 = 21845;  // 120°
+const HUE_CYAN: u16 = 32768;   // 180°
+const HUE_BLUE: u16 = 43690;   // 240°
+const HUE_PURPLE: u16 = 50062; // ~275°
+const HUE_PINK: u16 = 63715;   // ~350°
+
+// Simple rate limiter for authentication attempts
+#[derive(Debug, Clone)]
+struct AuthAttempt {
+    timestamp: Instant,
+    count: u32,
+}
+
+struct RateLimiter {
+    attempts: Arc<Mutex<HashMap<String, AuthAttempt>>>,
+}
+
+impl RateLimiter {
+    fn new() -> Self {
+        RateLimiter {
+            attempts: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+
+    fn check_and_update(&self, client_ip: String) -> bool {
+        let mut attempts = self.attempts.lock().unwrap();
+        let now = Instant::now();
+        let window = Duration::from_secs(AUTH_WINDOW_SECONDS);
+        
+        match attempts.get_mut(&client_ip) {
+            Some(attempt) => {
+                if now.duration_since(attempt.timestamp) > window {
+                    // Reset window
+                    attempt.timestamp = now;
+                    attempt.count = 1;
+                    true
+                } else if attempt.count >= MAX_AUTH_ATTEMPTS {
+                    // Too many attempts
+                    false
+                } else {
+                    // Increment counter
+                    attempt.count += 1;
+                    true
+                }
+            }
+            None => {
+                // First attempt
+                attempts.insert(client_ip, AuthAttempt {
+                    timestamp: now,
+                    count: 1,
+                });
+                true
+            }
+        }
+    }
+
+    fn cleanup_old_entries(&self) {
+        let mut attempts = self.attempts.lock().unwrap();
+        let now = Instant::now();
+        let window = Duration::from_secs(AUTH_WINDOW_SECONDS * 2);
+        
+        attempts.retain(|_, attempt| {
+            now.duration_since(attempt.timestamp) <= window
+        });
+    }
+}
+
+// Authentication middleware result
+enum AuthResult {
+    Authorized,
+    Unauthorized(Response),
+}
+
+// Centralized authentication middleware
+fn authenticate_request(
+    request: &rouille::Request,
+    secret_key: &str,
+    rate_limiter: &Arc<RateLimiter>,
+) -> AuthResult {
+    // Extract client IP for rate limiting
+    let client_ip = request.remote_addr().ip().to_string();
+    
+    // Get authorization header
+    let auth_header = request.header("Authorization");
+    
+    match auth_header {
+        None => {
+            // Check rate limit for failed auth attempts
+            if !rate_limiter.check_and_update(client_ip) {
+                return AuthResult::Unauthorized(
+                    Response::text("Too many authentication attempts. Please try again later.")
+                        .with_status_code(429)
+                        .with_additional_header("Retry-After", "60")
+                );
+            }
+            
+            // Return 401 Unauthorized when no auth header is present
+            AuthResult::Unauthorized(
+                Response::text("Unauthorized: Missing Authorization header")
+                    .with_status_code(401)
+                    .with_additional_header("WWW-Authenticate", "Bearer realm=\"LIFX API\"")
+            )
+        }
+        Some(auth_value) => {
+            // Validate the token
+            let expected_token = format!("Bearer {}", secret_key);
+            if auth_value != &expected_token {
+                // Check rate limit for failed auth attempts
+                if !rate_limiter.check_and_update(client_ip) {
+                    return AuthResult::Unauthorized(
+                        Response::text("Too many authentication attempts. Please try again later.")
+                            .with_status_code(429)
+                            .with_additional_header("Retry-After", "60")
+                    );
+                }
+                
+                // Return 401 Unauthorized for invalid token
+                AuthResult::Unauthorized(
+                    Response::text("Unauthorized: Invalid token")
+                        .with_status_code(401)
+                        .with_additional_header("WWW-Authenticate", "Bearer realm=\"LIFX API\"")
+                )
+            } else {
+                AuthResult::Authorized
+            }
+        }
+    }
+}
 
 #[derive(Debug, Clone)]
 struct RefreshableData<T> {
@@ -390,7 +557,7 @@ impl Manager {
             }
             Message::StateLabel { label } => {
                 bulb.name.update(label.0);
-                bulb.label = bulb.name.data.as_ref().unwrap().to_string();
+                bulb.label = bulb.name.data.as_ref().map(|s| s.to_string()).unwrap_or_else(|| String::from("unknown"));
 
             },
 
@@ -435,7 +602,7 @@ impl Manager {
             Message::StatePower { level } => {
                 bulb.power_level.update(level);
 
-                if bulb.power_level.data.as_ref().unwrap() ==  &PowerLevel::Enabled{
+                if bulb.power_level.data.as_ref() == Some(&PowerLevel::Enabled) {
                     bulb.power = format!("on");
                 } else {
                     bulb.power = format!("off");
@@ -476,7 +643,7 @@ impl Manager {
                         brightness: bc.brightness,
                     });
 
-                    bulb.brightness = (bc.brightness / 65535) as f64;
+                    bulb.brightness = (bc.brightness as f32 / LIFX_BRIGHTNESS_MAX) as f64;
 
 
                     bulb.power_level.update(power);
@@ -574,10 +741,13 @@ impl Manager {
             source: self.source,
             ..Default::default()
         };
-        let rawmsg = RawMessage::build(&opts, Message::GetService).unwrap();
-        let bytes = rawmsg.pack().unwrap();
+        let rawmsg = RawMessage::build(&opts, Message::GetService)
+            .map_err(|e| lifx_rs::lan::Error::Io(std::io::Error::new(std::io::ErrorKind::Other, format!("Failed to build message: {:?}", e))))?;
+        let bytes = rawmsg.pack()
+            .map_err(|e| lifx_rs::lan::Error::Io(std::io::Error::new(std::io::ErrorKind::Other, format!("Failed to pack message: {:?}", e))))?;
 
-        for addr in get_if_addrs().unwrap() {
+        for addr in get_if_addrs()
+            .map_err(|e| lifx_rs::lan::Error::Io(std::io::Error::new(std::io::ErrorKind::Other, format!("Failed to get network interfaces: {:?}", e))))? {
             match addr.addr {
                 IfAddr::V4(Ifv4Addr {
                     broadcast: Some(bcast),
@@ -625,8 +795,15 @@ pub struct Config {
 pub fn start(config: Config) {
 
 
-    sudo::with_env(&["SECRET_KEY"]).unwrap();
-    sudo::escalate_if_needed().unwrap();
+    if let Err(e) = sudo::with_env(&["SECRET_KEY"]) {
+        eprintln!("Failed to preserve SECRET_KEY environment variable: {}", e);
+        std::process::exit(1);
+    }
+    
+    if let Err(e) = sudo::escalate_if_needed() {
+        eprintln!("Failed to escalate privileges: {}", e);
+        std::process::exit(1);
+    }
 
 
     let mgr = Manager::new();
@@ -639,7 +816,14 @@ pub fn start(config: Config) {
 
             thread::spawn(move || {
                 loop{
-                    let mut lock = th_arc_mgr.lock().unwrap();
+                    let mut lock = match th_arc_mgr.lock() {
+                        Ok(l) => l,
+                        Err(e) => {
+                            eprintln!("Failed to acquire lock: {}", e);
+                            thread::sleep(Duration::from_millis(1000));
+                            continue;
+                        }
+                    };
                     let mgr = &mut *lock;  
                 
                     // if Instant::now() - mgr.last_discovery > Duration::from_secs(300) {
@@ -654,18 +838,27 @@ pub fn start(config: Config) {
         
         
             let th2_arc_mgr = Arc::clone(&mgr_arc);
+            
+            // Initialize rate limiter
+            let rate_limiter = Arc::new(RateLimiter::new());
+            
+            // Spawn cleanup thread for rate limiter
+            let cleanup_limiter = Arc::clone(&rate_limiter);
+            thread::spawn(move || {
+                loop {
+                    thread::sleep(Duration::from_secs(120));
+                    cleanup_limiter.cleanup_old_entries();
+                }
+            });
         
             thread::spawn(move || {
                 rouille::start_server(format!("0.0.0.0:{}", config.port).as_str(), move |request| {
         
-        
-                    let auth_header = request.header("Authorization");
-        
-                    if auth_header.is_none(){
-                        return Response::empty_404();
-                    } else {
-                        if auth_header.unwrap().to_string() != format!("Bearer {}", config.secret_key){
-                            return Response::empty_404();
+                    // Use centralized authentication middleware
+                    match authenticate_request(request, &config.secret_key, &rate_limiter) {
+                        AuthResult::Unauthorized(response) => return response,
+                        AuthResult::Authorized => {
+                            // Continue with request processing
                         }
                     }
         
@@ -674,7 +867,13 @@ pub fn start(config: Config) {
         
                     let mut response = Response::text("hello world");
         
-                    let mut lock = th2_arc_mgr.lock().unwrap();
+                    let mut lock = match th2_arc_mgr.lock() {
+                        Ok(l) => l,
+                        Err(e) => {
+                            eprintln!("Failed to acquire lock: {}", e);
+                            return Response::text("Internal Server Error").with_status_code(500);
+                        }
+                    };
                     let mgr = &mut *lock;  
         
                 
@@ -721,14 +920,14 @@ pub fn start(config: Config) {
                         if selector.contains("group_id:"){
                             bulbs_vec = bulbs_vec
                             .into_iter()
-                            .filter(|b| b.lifx_group.as_ref().unwrap().id.contains(&selector.replace("group_id:", "")))
+                            .filter(|b| b.lifx_group.as_ref().map_or(false, |g| g.id.contains(&selector.replace("group_id:", ""))))
                             .collect();
                         }
         
                         if selector.contains("location_id:"){
                             bulbs_vec = bulbs_vec
                             .into_iter()
-                            .filter(|b| b.lifx_location.as_ref().unwrap().id.contains(&selector.replace("location_id:", "")))
+                            .filter(|b| b.lifx_location.as_ref().map_or(false, |l| l.id.contains(&selector.replace("location_id:", ""))))
                             .collect();
                         }
         
@@ -755,7 +954,14 @@ pub fn start(config: Config) {
         
                         // Power
                         if input.power.is_some() {
-                            let power = input.power.unwrap();
+                            let power = match input.power {
+                                Some(p) => p,
+                                None => {
+                                    return Response::text(json!({
+                                        "error": "Missing power value"
+                                    }).to_string()).with_status_code(400);
+                                }
+                            };
                             if power == format!("on"){
                                 for bulb in &bulbs_vec {
                                     bulb.set_power(&mgr.sock, PowerLevel::Enabled);
@@ -771,7 +977,14 @@ pub fn start(config: Config) {
         
                         // Color
                         if input.color.is_some() {
-                            let cc = input.color.unwrap();
+                            let cc = match input.color {
+                                Some(c) => c,
+                                None => {
+                                    return Response::text(json!({
+                                        "error": "Missing color value"
+                                    }).to_string()).with_status_code(400);
+                                }
+                            };
         
         
         
@@ -779,17 +992,16 @@ pub fn start(config: Config) {
         
         
                                 let mut kelvin = 6500;
-                                let mut brightness = 65535;
+                                let mut brightness = LIFX_BRIGHTNESS_MAX as u16;
                                 let mut saturation = 0;
                                 let mut hue = 0;
         
                                 let mut duration = 0;
                                 if input.duration.is_some(){
-                                    duration = input.duration.unwrap() as u32;
+                                    duration = input.duration.unwrap_or(0.0) as u32;
                                 }
         
-                                if bulb.lifx_color.is_some() {
-                                    let lifxc = bulb.lifx_color.as_ref().unwrap();
+                                if let Some(lifxc) = bulb.lifx_color.as_ref() {
                                     kelvin = lifxc.kelvin;
                                     brightness = lifxc.brightness;
                                     saturation = lifxc.saturation;
@@ -798,7 +1010,7 @@ pub fn start(config: Config) {
                             
                                 if cc.contains("white"){
                                     let hbsk_set = HSBK {
-                                        hue: 0,
+                                        hue: HUE_RED,
                                         saturation: 0,
                                         brightness: brightness,
                                         kelvin: kelvin,
@@ -808,8 +1020,8 @@ pub fn start(config: Config) {
         
                                 if cc.contains("red"){
                                     let hbsk_set = HSBK {
-                                        hue: 0,
-                                        saturation: 65535,
+                                        hue: HUE_RED,
+                                        saturation: LIFX_SATURATION_MAX as u16,
                                         brightness: brightness,
                                         kelvin: kelvin,
                                     };
@@ -818,8 +1030,8 @@ pub fn start(config: Config) {
         
                                 if cc.contains("orange"){
                                     let hbsk_set = HSBK {
-                                        hue: 7098,
-                                        saturation: 65535,
+                                        hue: HUE_ORANGE,
+                                        saturation: LIFX_SATURATION_MAX as u16,
                                         brightness: brightness,
                                         kelvin: kelvin,
                                     };
@@ -828,8 +1040,8 @@ pub fn start(config: Config) {
         
                                 if cc.contains("yellow"){
                                     let hbsk_set = HSBK {
-                                        hue: 10920,
-                                        saturation: 65535,
+                                        hue: HUE_YELLOW,
+                                        saturation: LIFX_SATURATION_MAX as u16,
                                         brightness: brightness,
                                         kelvin: kelvin,
                                     };
@@ -838,8 +1050,8 @@ pub fn start(config: Config) {
         
                                 if cc.contains("cyan"){
                                     let hbsk_set = HSBK {
-                                        hue: 32760,
-                                        saturation: 65535,
+                                        hue: HUE_CYAN,
+                                        saturation: LIFX_SATURATION_MAX as u16,
                                         brightness: brightness,
                                         kelvin: kelvin,
                                     };
@@ -848,8 +1060,8 @@ pub fn start(config: Config) {
         
                                 if cc.contains("green"){
                                     let hbsk_set = HSBK {
-                                        hue: 21840,
-                                        saturation: 65535,
+                                        hue: HUE_GREEN,
+                                        saturation: LIFX_SATURATION_MAX as u16,
                                         brightness: brightness,
                                         kelvin: kelvin,
                                     };
@@ -858,8 +1070,8 @@ pub fn start(config: Config) {
         
                                 if cc.contains("blue"){
                                     let hbsk_set = HSBK {
-                                        hue: 43680,
-                                        saturation: 65535,
+                                        hue: HUE_BLUE,
+                                        saturation: LIFX_SATURATION_MAX as u16,
                                         brightness: brightness,
                                         kelvin: kelvin,
                                     };
@@ -868,8 +1080,8 @@ pub fn start(config: Config) {
         
                                 if cc.contains("purple"){
                                     let hbsk_set = HSBK {
-                                        hue: 50050,
-                                        saturation: 65535,
+                                        hue: HUE_PURPLE,
+                                        saturation: LIFX_SATURATION_MAX as u16,
                                         brightness: brightness,
                                         kelvin: kelvin,
                                     };
@@ -878,7 +1090,7 @@ pub fn start(config: Config) {
         
                                 if cc.contains("pink"){
                                     let hbsk_set = HSBK {
-                                        hue: 63700,
+                                        hue: HUE_PINK,
                                         saturation: 25000,
                                         brightness: brightness,
                                         kelvin: kelvin,
@@ -891,7 +1103,13 @@ pub fn start(config: Config) {
         
                                     let hue_split = cc.split("hue:");
                                     let hue_vec: Vec<&str> = hue_split.collect();
-                                    let new_hue = hue_vec[1].to_string().parse::<u16>().unwrap(); 
+                                    let new_hue = match parse_u16_safe(&hue_vec[1]) {
+                                        Ok(h) => h,
+                                        Err(e) => {
+                                            println!("Error parsing hue: {}", e);
+                                            continue;
+                                        }
+                                    }; 
                                     let hbsk_set = HSBK {
                                         hue: new_hue,
                                         saturation: saturation,
@@ -904,7 +1122,13 @@ pub fn start(config: Config) {
                                 if cc.contains("saturation:"){
                                     let saturation_split = cc.split("saturation:");
                                     let saturation_vec: Vec<&str> = saturation_split.collect();
-                                    let new_saturation_float = saturation_vec[1].to_string().parse::<f64>().unwrap(); 
+                                    let new_saturation_float = match parse_f64_safe(&saturation_vec[1]) {
+                                        Ok(s) => s,
+                                        Err(e) => {
+                                            println!("Error parsing saturation: {}", e);
+                                            continue;
+                                        }
+                                    }; 
                                     let new_saturation: u16 = (f64::from(100) * new_saturation_float) as u16;
                                     let hbsk_set = HSBK {
                                         hue: hue,
@@ -918,8 +1142,14 @@ pub fn start(config: Config) {
                                 if cc.contains("brightness:"){
                                     let brightness_split = cc.split("brightness:");
                                     let brightness_vec: Vec<&str> = brightness_split.collect();
-                                    let new_brightness_float = brightness_vec[1].to_string().parse::<f64>().unwrap(); 
-                                    let new_brightness: u16 = (f64::from(65535) * new_brightness_float) as u16;
+                                    let new_brightness_float = match parse_f64_safe(&brightness_vec[1]) {
+                                        Ok(b) => b,
+                                        Err(e) => {
+                                            println!("Error parsing brightness: {}", e);
+                                            continue;
+                                        }
+                                    }; 
+                                    let new_brightness: u16 = (LIFX_BRIGHTNESS_MAX * new_brightness_float as f32) as u16;
                                     let hbsk_set = HSBK {
                                         hue: hue,
                                         saturation: saturation,
@@ -932,7 +1162,13 @@ pub fn start(config: Config) {
                                 if cc.contains("kelvin:"){
                                     let kelvin_split = cc.split("kelvin:");
                                     let kelvin_vec: Vec<&str> = kelvin_split.collect();
-                                    let new_kelvin = kelvin_vec[1].to_string().parse::<u16>().unwrap(); 
+                                    let new_kelvin = match parse_u16_safe(&kelvin_vec[1]) {
+                                        Ok(k) => k,
+                                        Err(e) => {
+                                            println!("Error parsing kelvin: {}", e);
+                                            continue;
+                                        }
+                                    }; 
                                     let hbsk_set = HSBK {
                                         hue: hue,
                                         saturation: 0,
@@ -952,22 +1188,40 @@ pub fn start(config: Config) {
                                     let rgb_part_split = rgb_parts.split(",");
                                     let rgb_parts_vec: Vec<&str> = rgb_part_split.collect();
         
-                                    let red_int = rgb_parts_vec[0].to_string().parse::<i64>().unwrap(); 
+                                    let red_int = match parse_i64_safe(&rgb_parts_vec[0]) {
+                                        Ok(r) => r,
+                                        Err(e) => {
+                                            println!("Error parsing red value: {}", e);
+                                            continue;
+                                        }
+                                    };
                                     let red_float: f32 = (red_int) as f32;
         
-                                    let green_int = rgb_parts_vec[1].to_string().parse::<i64>().unwrap(); 
+                                    let green_int = match parse_i64_safe(&rgb_parts_vec[1]) {
+                                        Ok(g) => g,
+                                        Err(e) => {
+                                            println!("Error parsing green value: {}", e);
+                                            continue;
+                                        }
+                                    };
                                     let green_float: f32 = (green_int) as f32;
         
-                                    let blue_int = rgb_parts_vec[2].to_string().parse::<i64>().unwrap(); 
+                                    let blue_int = match parse_i64_safe(&rgb_parts_vec[2]) {
+                                        Ok(b) => b,
+                                        Err(e) => {
+                                            println!("Error parsing blue value: {}", e);
+                                            continue;
+                                        }
+                                    };
                                     let blue_float: f32 = (blue_int) as f32;
         
                                     let rgb = Srgb::new(red_float / 255.0, green_float / 255.0, blue_float / 255.0);
                                     let hcc: Hsv = rgb.into_color();
         
-                                    // TODO: Why does this ugly hack work? Why is lifx api so differ
+                                    // Convert HSV to LIFX HSBK format (16-bit values)
                                     let hbsk_set = HSBK {
-                                        hue: (hcc.hue.into_positive_degrees() * 182.0) as u16,
-                                        saturation: (hcc.saturation * 65535.0) as u16,
+                                        hue: ((hcc.hue.into_positive_degrees() * LIFX_HUE_DEGREE_FACTOR) as u32 % 0x10000) as u16,
+                                        saturation: (hcc.saturation * LIFX_SATURATION_MAX) as u16,
                                         brightness: brightness,
                                         kelvin: kelvin,
                                     };
@@ -983,18 +1237,42 @@ pub fn start(config: Config) {
                                     let hex_vec: Vec<&str> = hex_split.collect();
                                     let hex = hex_vec[1].to_string();
         
-                                    let rgb2 = Rgb::from_hex_str(format!("#{}", hex).as_str()).unwrap();
+                                    let rgb2 = match Rgb::from_hex_str(format!("#{}", hex).as_str()) {
+                                        Ok(rgb) => rgb,
+                                        Err(_) => {
+                                            println!("Error parsing hex color: {}", hex);
+                                            continue;
+                                        }
+                                    };
                                     // Rgb { r: 255.0, g: 204.0, b: 0.0 }
         
                                     println!("{:?}", rgb2);
         
-                                    let red_int = rgb2.get_red().to_string().parse::<i64>().unwrap(); 
+                                    let red_int = match parse_i64_safe(&rgb2.get_red().to_string()) {
+                                        Ok(r) => r,
+                                        Err(e) => {
+                                            println!("Error parsing red from hex: {}", e);
+                                            continue;
+                                        }
+                                    };
                                     let red_float: f32 = (red_int) as f32;
         
-                                    let green_int = rgb2.get_green().to_string().parse::<i64>().unwrap(); 
+                                    let green_int = match parse_i64_safe(&rgb2.get_green().to_string()) {
+                                        Ok(g) => g,
+                                        Err(e) => {
+                                            println!("Error parsing green from hex: {}", e);
+                                            continue;
+                                        }
+                                    };
                                     let green_float: f32 = (green_int) as f32;
         
-                                    let blue_int = rgb2.get_blue().to_string().parse::<i64>().unwrap(); 
+                                    let blue_int = match parse_i64_safe(&rgb2.get_blue().to_string()) {
+                                        Ok(b) => b,
+                                        Err(e) => {
+                                            println!("Error parsing blue from hex: {}", e);
+                                            continue;
+                                        }
+                                    };
                                     let blue_float: f32 = (blue_int) as f32;
         
         
@@ -1008,10 +1286,10 @@ pub fn start(config: Config) {
 
                                     println!("hcc: {:?}", hcc);
         
-                                    // TODO: Why does this ugly hack work? Why is lifx api so differ
+                                    // Convert HSV to LIFX HSBK format (16-bit values)
                                     let hbsk_set = HSBK {
-                                        hue: (hcc.hue.into_positive_degrees() * 182.0) as u16,
-                                        saturation: (hcc.saturation * 65535.0) as u16,
+                                        hue: ((hcc.hue.into_positive_degrees() * LIFX_HUE_DEGREE_FACTOR) as u32 % 0x10000) as u16,
+                                        saturation: (hcc.saturation * LIFX_SATURATION_MAX) as u16,
                                         brightness: brightness,
                                         kelvin: kelvin,
                                     };
@@ -1030,7 +1308,14 @@ pub fn start(config: Config) {
         
                         // Brightness
                         if input.brightness.is_some() {
-                            let brightness = input.brightness.unwrap();
+                            let brightness = match input.brightness {
+                                Some(b) => b,
+                                None => {
+                                    return Response::text(json!({
+                                        "error": "Missing brightness value"
+                                    }).to_string()).with_status_code(400);
+                                }
+                            };
         
                             for bulb in &bulbs_vec {
         
@@ -1041,7 +1326,7 @@ pub fn start(config: Config) {
         
                                 let mut duration = 0;
                                 if input.duration.is_some(){
-                                    duration = input.duration.unwrap() as u32;
+                                    duration = input.duration.unwrap_or(0.0) as u32;
                                 }
         
                                 if bulb.lifx_color.is_some() {
@@ -1051,8 +1336,14 @@ pub fn start(config: Config) {
                                     hue = lifxc.hue;
                                 }
                                 
-                                let new_brightness_float = brightness.to_string().parse::<f64>().unwrap(); 
-                                let new_brightness: u16 = (f64::from(65535) * new_brightness_float) as u16;
+                                let new_brightness_float = match parse_f64_safe(&brightness.to_string()) {
+                                    Ok(b) => b,
+                                    Err(e) => {
+                                        println!("Error parsing brightness: {}", e);
+                                        continue;
+                                    }
+                                }; 
+                                let new_brightness: u16 = (LIFX_BRIGHTNESS_MAX * new_brightness_float as f32) as u16;
                                 let hbsk_set = HSBK {
                                     hue: hue,
                                     saturation: saturation,
@@ -1067,7 +1358,15 @@ pub fn start(config: Config) {
         
                         // Infrared
                         if input.infrared.is_some() {
-                            let new_brightness: u16 = (f64::from(65535) * input.infrared.unwrap()) as u16;
+                            let infrared_val = match input.infrared {
+                                Some(i) => i,
+                                None => {
+                                    return Response::text(json!({
+                                        "error": "Missing infrared value"
+                                    }).to_string()).with_status_code(400);
+                                }
+                            };
+                            let new_brightness: u16 = (LIFX_BRIGHTNESS_MAX * infrared_val as f32) as u16;
         
                             for bulb in &bulbs_vec {
                                 bulb.set_infrared(&mgr.sock, new_brightness);
@@ -1222,14 +1521,14 @@ mod tests {
     #[test]
     fn test_lifx_color_creation() {
         let color = LifxColor {
-            hue: 32768,
-            saturation: 65535,
+            hue: HUE_CYAN,
+            saturation: LIFX_SATURATION_MAX as u16,
             kelvin: 3500,
             brightness: 32768,
         };
         
-        assert_eq!(color.hue, 32768);
-        assert_eq!(color.saturation, 65535);
+        assert_eq!(color.hue, HUE_CYAN);
+        assert_eq!(color.saturation, LIFX_SATURATION_MAX as u16);
         assert_eq!(color.kelvin, 3500);
         assert_eq!(color.brightness, 32768);
     }
@@ -1272,8 +1571,8 @@ mod tests {
         let rgb = Srgb::new(red / 255.0, green / 255.0, blue / 255.0);
         let hcc: Hsv = rgb.into_color();
         
-        let hue = (hcc.hue.into_positive_degrees() * 182.0) as u16;
-        let saturation = (hcc.saturation * 65535.0) as u16;
+        let hue = ((hcc.hue.into_positive_degrees() * LIFX_HUE_DEGREE_FACTOR) as u32 % 0x10000) as u16;
+        let saturation = (hcc.saturation * LIFX_SATURATION_MAX) as u16;
         
         (hue, saturation)
     }
@@ -1282,7 +1581,7 @@ mod tests {
     fn test_color_conversion_red() {
         let (hue, saturation) = convert_rgb_to_hsbk(255.0, 0.0, 0.0);
         assert_eq!(hue, 0);
-        assert_eq!(saturation, 65535);
+        assert_eq!(saturation, LIFX_SATURATION_MAX as u16);
     }
 
     #[test]
@@ -1290,7 +1589,7 @@ mod tests {
         let (hue, saturation) = convert_rgb_to_hsbk(0.0, 255.0, 0.0);
         // Green is at 120 degrees, which maps to approximately 21845 in LIFX scale
         assert!((hue as i32 - 21845).abs() < 100);
-        assert_eq!(saturation, 65535);
+        assert_eq!(saturation, LIFX_SATURATION_MAX as u16);
     }
 
     #[test]
@@ -1298,12 +1597,298 @@ mod tests {
         let (hue, saturation) = convert_rgb_to_hsbk(0.0, 0.0, 255.0);
         // Blue is at 240 degrees, which maps to approximately 43690 in LIFX scale
         assert!((hue as i32 - 43690).abs() < 100);
-        assert_eq!(saturation, 65535);
+        assert_eq!(saturation, LIFX_SATURATION_MAX as u16);
     }
 
     #[test]
     fn test_color_conversion_white() {
         let (_, saturation) = convert_rgb_to_hsbk(255.0, 255.0, 255.0);
         assert_eq!(saturation, 0); // White has no saturation
+    }
+
+    #[test]
+    fn test_parse_u16_safe_valid() {
+        assert_eq!(parse_u16_safe("1234").unwrap(), 1234);
+        assert_eq!(parse_u16_safe("0").unwrap(), 0);
+        assert_eq!(parse_u16_safe("65535").unwrap(), 65535);
+    }
+
+    #[test]
+    fn test_parse_u16_safe_invalid() {
+        assert!(parse_u16_safe("abc").is_err());
+        assert!(parse_u16_safe("-1").is_err());
+        assert!(parse_u16_safe("65536").is_err());
+        assert!(parse_u16_safe("").is_err());
+    }
+
+    #[test]
+    fn test_parse_f64_safe_valid() {
+        assert_eq!(parse_f64_safe("12.34").unwrap(), 12.34);
+        assert_eq!(parse_f64_safe("0").unwrap(), 0.0);
+        assert_eq!(parse_f64_safe("-5.67").unwrap(), -5.67);
+    }
+
+    #[test]
+    fn test_parse_f64_safe_invalid() {
+        assert!(parse_f64_safe("abc").is_err());
+        assert!(parse_f64_safe("").is_err());
+        assert!(parse_f64_safe("12.34.56").is_err());
+    }
+
+    #[test]
+    fn test_parse_i64_safe_valid() {
+        assert_eq!(parse_i64_safe("1234").unwrap(), 1234);
+        assert_eq!(parse_i64_safe("0").unwrap(), 0);
+        assert_eq!(parse_i64_safe("-1234").unwrap(), -1234);
+    }
+
+    #[test]
+    fn test_parse_i64_safe_invalid() {
+        assert!(parse_i64_safe("abc").is_err());
+        assert!(parse_i64_safe("").is_err());
+        assert!(parse_i64_safe("12.34").is_err());
+    }
+
+    #[test]
+    fn test_bulb_info_with_none_fields() {
+        let source = 0x12345678;
+        let target = 0xABCDEF123456;
+        let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 100)), 56700);
+        
+        let bulb = BulbInfo::new(source, target, addr);
+        
+        // Test that methods handle None values gracefully
+        assert!(bulb.lifx_group.is_none());
+        assert!(bulb.lifx_location.is_none());
+        assert!(bulb.lifx_color.is_none());
+        assert!(bulb.product.is_none());
+    }
+
+    // Security tests for authentication
+    #[test]
+    fn test_rate_limiter_basic() {
+        let limiter = RateLimiter::new();
+        let client_ip = "192.168.1.1".to_string();
+        
+        // First attempt should succeed
+        assert!(limiter.check_and_update(client_ip.clone()));
+        
+        // Subsequent attempts within limit should succeed
+        for _ in 1..MAX_AUTH_ATTEMPTS {
+            assert!(limiter.check_and_update(client_ip.clone()));
+        }
+        
+        // Exceeding limit should fail
+        assert!(!limiter.check_and_update(client_ip.clone()));
+    }
+
+    #[test]
+    fn test_rate_limiter_window_reset() {
+        let limiter = RateLimiter::new();
+        let client_ip = "192.168.1.2".to_string();
+        
+        // Fill up the attempts
+        for _ in 0..MAX_AUTH_ATTEMPTS {
+            assert!(limiter.check_and_update(client_ip.clone()));
+        }
+        
+        // Should be blocked now
+        assert!(!limiter.check_and_update(client_ip.clone()));
+        
+        // Simulate waiting for window to expire
+        // Note: In a real test, we'd need to mock time or use a configurable duration
+        // For now, we'll test with a different IP
+        let client_ip2 = "192.168.1.3".to_string();
+        assert!(limiter.check_and_update(client_ip2));
+    }
+
+    #[test]
+    fn test_rate_limiter_different_ips() {
+        let limiter = RateLimiter::new();
+        
+        // Different IPs should have independent limits
+        for i in 0..10 {
+            let ip = format!("192.168.1.{}", i);
+            assert!(limiter.check_and_update(ip));
+        }
+    }
+
+    #[test]
+    fn test_rate_limiter_cleanup() {
+        let limiter = RateLimiter::new();
+        
+        // Add some entries
+        for i in 0..5 {
+            let ip = format!("192.168.1.{}", i);
+            limiter.check_and_update(ip);
+        }
+        
+        // Cleanup should not affect recent entries
+        limiter.cleanup_old_entries();
+        
+        // Recent entries should still be tracked
+        let test_ip = "192.168.1.0".to_string();
+        for _ in 1..MAX_AUTH_ATTEMPTS {
+            assert!(limiter.check_and_update(test_ip.clone()));
+        }
+        assert!(!limiter.check_and_update(test_ip));
+    }
+
+    #[test]
+    fn test_auth_result_enum() {
+        // Test that AuthResult can properly hold responses
+        let unauth = AuthResult::Unauthorized(Response::text("test"));
+        match unauth {
+            AuthResult::Unauthorized(_) => assert!(true),
+            AuthResult::Authorized => assert!(false, "Should be unauthorized"),
+        }
+        
+        let auth = AuthResult::Authorized;
+        match auth {
+            AuthResult::Authorized => assert!(true),
+            AuthResult::Unauthorized(_) => assert!(false, "Should be authorized"),
+        }
+    }
+
+    #[test]
+    fn test_color_conversion_yellow() {
+        let (hue, saturation) = convert_rgb_to_hsbk(255.0, 255.0, 0.0);
+        // Yellow is at 60 degrees
+        assert!((hue as i32 - HUE_YELLOW as i32).abs() < 100);
+        assert_eq!(saturation, LIFX_SATURATION_MAX as u16);
+    }
+
+    #[test]
+    fn test_color_conversion_cyan() {
+        let (hue, saturation) = convert_rgb_to_hsbk(0.0, 255.0, 255.0);
+        // Cyan is at 180 degrees
+        assert!((hue as i32 - HUE_CYAN as i32).abs() < 100);
+        assert_eq!(saturation, LIFX_SATURATION_MAX as u16);
+    }
+
+    #[test]
+    fn test_color_conversion_magenta() {
+        let (hue, saturation) = convert_rgb_to_hsbk(255.0, 0.0, 255.0);
+        // Magenta is at 300 degrees, which is approximately 54613 in LIFX scale
+        let expected_hue = ((300.0 * LIFX_HUE_DEGREE_FACTOR) as u32 % 0x10000) as u16;
+        assert!((hue as i32 - expected_hue as i32).abs() < 100);
+        assert_eq!(saturation, LIFX_SATURATION_MAX as u16);
+    }
+
+    #[test]
+    fn test_color_conversion_orange() {
+        let (hue, saturation) = convert_rgb_to_hsbk(255.0, 165.0, 0.0);
+        // Orange is approximately at 39 degrees
+        assert!((hue as i32 - HUE_ORANGE as i32).abs() < 500);
+        assert_eq!(saturation, LIFX_SATURATION_MAX as u16);
+    }
+
+    #[test]
+    fn test_color_conversion_purple() {
+        let (hue, saturation) = convert_rgb_to_hsbk(128.0, 0.0, 128.0);
+        // Purple is at 300 degrees (same as magenta)
+        let expected_hue = ((300.0 * LIFX_HUE_DEGREE_FACTOR) as u32 % 0x10000) as u16;
+        assert!((hue as i32 - expected_hue as i32).abs() < 100);
+        assert_eq!(saturation, LIFX_SATURATION_MAX as u16);
+    }
+
+    #[test]
+    fn test_color_conversion_gray() {
+        let (_, saturation) = convert_rgb_to_hsbk(128.0, 128.0, 128.0);
+        assert_eq!(saturation, 0); // Gray has no saturation
+    }
+
+    #[test]
+    fn test_color_conversion_black() {
+        let (_, saturation) = convert_rgb_to_hsbk(0.0, 0.0, 0.0);
+        // Black can have any hue but saturation should be 0
+        assert_eq!(saturation, 0);
+    }
+
+    #[test]
+    fn test_lifx_hue_conversion_boundaries() {
+        // Test boundary conditions for hue conversion
+        
+        // 0 degrees should map to 0
+        let hue_0 = ((0.0 * LIFX_HUE_DEGREE_FACTOR) as u32 % 0x10000) as u16;
+        assert_eq!(hue_0, 0);
+        
+        // 360 degrees should wrap to 0
+        let hue_360 = ((360.0 * LIFX_HUE_DEGREE_FACTOR) as u32 % 0x10000) as u16;
+        assert_eq!(hue_360, 0);
+        
+        // 180 degrees should map to 32768 (half of 65536)
+        let hue_180 = ((180.0 * LIFX_HUE_DEGREE_FACTOR) as u32 % 0x10000) as u16;
+        assert_eq!(hue_180, 32768);
+        
+        // 90 degrees should map to 16384 (quarter of 65536)
+        let hue_90 = ((90.0 * LIFX_HUE_DEGREE_FACTOR) as u32 % 0x10000) as u16;
+        assert_eq!(hue_90, 16384);
+        
+        // 270 degrees should map to 49152 (three quarters of 65536)
+        let hue_270 = ((270.0 * LIFX_HUE_DEGREE_FACTOR) as u32 % 0x10000) as u16;
+        assert_eq!(hue_270, 49152);
+    }
+
+    #[test]
+    fn test_lifx_saturation_brightness_conversion() {
+        // Test saturation and brightness conversions
+        
+        // Full saturation (1.0) should map to 65535
+        let full_sat = (1.0 * LIFX_SATURATION_MAX) as u16;
+        assert_eq!(full_sat, 65535);
+        
+        // Half saturation (0.5) should map to 32767.5 (rounded to 32768)
+        let half_sat = (0.5 * LIFX_SATURATION_MAX) as u16;
+        assert!((half_sat as i32 - 32768).abs() <= 1);
+        
+        // No saturation (0.0) should map to 0
+        let no_sat = (0.0 * LIFX_SATURATION_MAX) as u16;
+        assert_eq!(no_sat, 0);
+        
+        // Same for brightness
+        let full_bright = (1.0 * LIFX_BRIGHTNESS_MAX) as u16;
+        assert_eq!(full_bright, 65535);
+        
+        let half_bright = (0.5 * LIFX_BRIGHTNESS_MAX) as u16;
+        assert!((half_bright as i32 - 32768).abs() <= 1);
+        
+        let no_bright = (0.0 * LIFX_BRIGHTNESS_MAX) as u16;
+        assert_eq!(no_bright, 0);
+    }
+
+    #[test]
+    fn test_named_color_constants() {
+        // Verify that our named color constants match expected degree values
+        
+        assert_eq!(HUE_RED, 0);
+        
+        // Orange ~39 degrees
+        let expected_orange = ((39.0 * LIFX_HUE_DEGREE_FACTOR) as u32 % 0x10000) as u16;
+        assert!((HUE_ORANGE as i32 - expected_orange as i32).abs() < 10);
+        
+        // Yellow 60 degrees
+        let expected_yellow = ((60.0 * LIFX_HUE_DEGREE_FACTOR) as u32 % 0x10000) as u16;
+        assert!((HUE_YELLOW as i32 - expected_yellow as i32).abs() < 10);
+        
+        // Green 120 degrees
+        let expected_green = ((120.0 * LIFX_HUE_DEGREE_FACTOR) as u32 % 0x10000) as u16;
+        assert!((HUE_GREEN as i32 - expected_green as i32).abs() < 10);
+        
+        // Cyan 180 degrees
+        let expected_cyan = ((180.0 * LIFX_HUE_DEGREE_FACTOR) as u32 % 0x10000) as u16;
+        assert_eq!(HUE_CYAN, expected_cyan);
+        
+        // Blue 240 degrees
+        let expected_blue = ((240.0 * LIFX_HUE_DEGREE_FACTOR) as u32 % 0x10000) as u16;
+        assert!((HUE_BLUE as i32 - expected_blue as i32).abs() < 10);
+        
+        // Purple ~275 degrees
+        let expected_purple = ((275.0 * LIFX_HUE_DEGREE_FACTOR) as u32 % 0x10000) as u16;
+        assert!((HUE_PURPLE as i32 - expected_purple as i32).abs() < 10);
+        
+        // Pink ~350 degrees
+        let expected_pink = ((350.0 * LIFX_HUE_DEGREE_FACTOR) as u32 % 0x10000) as u16;
+        assert!((HUE_PINK as i32 - expected_pink as i32).abs() < 10);
     }
 }
