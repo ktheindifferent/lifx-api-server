@@ -27,6 +27,9 @@ use palette::{Hsv, Srgb, IntoColor};
 
 use colors_transform::{Rgb, Color};
 
+pub mod set_states;
+use set_states::{SetStatesHandler, StatesRequest};
+
 
 
 const HOUR: Duration = Duration::from_secs(60 * 60);
@@ -198,7 +201,7 @@ fn authenticate_request(
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct RefreshableData<T> {
     data: Option<T>,
     max_age: Duration,
@@ -229,8 +232,8 @@ impl<T> RefreshableData<T> {
     }
 }
 
-#[derive(Debug, Serialize)]
-struct BulbInfo {
+#[derive(Debug, Clone, Serialize)]
+pub struct BulbInfo {
     pub id: String,
     pub uuid: String,
     pub label: String,
@@ -281,6 +284,7 @@ struct BulbInfo {
 }
 
 #[derive(Debug)]
+#[derive(Clone)]
 enum LiColor {
     Unknown,
     Single(RefreshableData<HSBK>),
@@ -290,6 +294,7 @@ enum LiColor {
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 #[doc(hidden)]
+#[derive(Clone)]
 pub struct LifxLocation {
     pub id: String,
     pub name: String,
@@ -298,6 +303,7 @@ pub struct LifxLocation {
 /// Represents an LIFX Color
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
+#[derive(Clone)]
 pub struct LifxColor {
     pub hue: u16,
     pub saturation: u16,
@@ -308,6 +314,7 @@ pub struct LifxColor {
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 #[doc(hidden)]
+#[derive(Clone)]
 pub struct LifxGroup {
     pub id: String,
     pub name: String,
@@ -509,11 +516,11 @@ impl BulbInfo {
 //     }
 // }
 
-struct Manager {
-    bulbs: Arc<Mutex<HashMap<u64, BulbInfo>>>,
-    last_discovery: Instant,
-    sock: UdpSocket,
-    source: u32,
+pub struct Manager {
+    pub bulbs: Arc<Mutex<HashMap<u64, BulbInfo>>>,
+    pub last_discovery: Instant,
+    pub sock: UdpSocket,
+    pub source: u32,
 }
 
 impl Manager {
@@ -932,221 +939,51 @@ pub fn start(config: Config) {
             
         
         
-                    let mut bulbs_vec: Vec<&BulbInfo> = Vec::new();
-        
-                    let bulbs = match mgr.bulbs.lock() {
-                        Ok(b) => b,
-                        Err(e) => {
-                            eprintln!("Failed to acquire bulbs lock: {}", e);
-                            return Response::text("Internal Server Error").with_status_code(500);
-                        }
-                    };
-                    
-                        
-                    for bulb in bulbs.values() {
-                        println!("{:?}", *bulb);
-                        bulbs_vec.push(bulb);
-                    }
-        
-                    if selector == "all"{
-                    
-                    }
-        
-                    if selector.contains("group_id:"){
-                        bulbs_vec = bulbs_vec
-                        .into_iter()
-                        .filter(|b| b.lifx_group.as_ref().map_or(false, |g| g.id.contains(&selector.replace("group_id:", ""))))
-                        .collect();
-                    }
-        
-                    if selector.contains("location_id:"){
-                        bulbs_vec = bulbs_vec
-                        .into_iter()
-                        .filter(|b| b.lifx_location.as_ref().map_or(false, |l| l.id.contains(&selector.replace("location_id:", ""))))
-                        .collect();
-                    }
-        
-                    if selector.contains("id:"){
-                        bulbs_vec = bulbs_vec
-                        .into_iter()
-                        .filter(|b| b.id.contains(&selector.replace("id:", "")))
-                        .collect();
-                    }
-        
-        
                     // (PUT) SetStates
                     // https://api.lifx.com/v1/lights/states
                     if request.url().contains("/lights/states") && request.method() == "PUT" {
-                        #[derive(Deserialize)]
-                        struct StateUpdate {
-                            selector: String,
-                            power: Option<String>,
-                            color: Option<String>,
-                            brightness: Option<f64>,
-                            duration: Option<f64>,
-                            infrared: Option<f64>,
-                            fast: Option<bool>,
-                        }
-
-                        #[derive(Deserialize)]
-                        struct StatesRequest {
-                            states: Vec<StateUpdate>,
-                            defaults: Option<StateUpdate>,
-                        }
-
-                        #[derive(Serialize)]
-                        struct StateResult {
-                            id: String,
-                            label: String,
-                            status: String,
-                        }
-
-                        #[derive(Serialize)]
-                        struct StatesResponse {
-                            results: Vec<StateResult>,
-                        }
-
                         let body = try_or_400!(rouille::input::plain_text_body(request));
                         let input: StatesRequest = try_or_400!(serde_json::from_str(&body));
-                        let mut results = Vec::new();
-
-                        for state_update in input.states {
-                            // Filter bulbs based on selector
-                            let mut filtered_bulbs: Vec<&BulbInfo> = Vec::new();
+                        
+                        let handler = SetStatesHandler::new();
+                        let states_response = handler.handle_request(mgr, input);
+                        response = Response::json(&states_response);
+                    } else {
+                        // For other endpoints, we need bulbs_vec
+                        let mut bulbs_vec: Vec<&BulbInfo> = Vec::new();
+        
+                        let bulbs = mgr.bulbs.lock().unwrap();
+                        
                             
-                            for bulb in bulbs.values() {
-                                let mut matches = false;
-                                
-                                if state_update.selector == "all" {
-                                    matches = true;
-                                } else if state_update.selector.starts_with("id:") {
-                                    let id = state_update.selector.strip_prefix("id:").unwrap_or("");
-                                    matches = bulb.id.contains(id);
-                                } else if state_update.selector.starts_with("group_id:") {
-                                    let group_id = state_update.selector.strip_prefix("group_id:").unwrap_or("");
-                                    matches = bulb.lifx_group.as_ref().map_or(false, |g| g.id.contains(group_id));
-                                } else if state_update.selector.starts_with("location_id:") {
-                                    let location_id = state_update.selector.strip_prefix("location_id:").unwrap_or("");
-                                    matches = bulb.lifx_location.as_ref().map_or(false, |l| l.id.contains(location_id));
-                                } else if state_update.selector.starts_with("label:") {
-                                    let label = state_update.selector.strip_prefix("label:").unwrap_or("");
-                                    matches = bulb.label.contains(label);
-                                }
-                                
-                                if matches {
-                                    filtered_bulbs.push(bulb);
-                                }
-                            }
-
-                            // Apply state changes to filtered bulbs
-                            for bulb in filtered_bulbs {
-                                let mut status = "ok";
-                                
-                                // Apply power state
-                                if let Some(ref power) = state_update.power {
-                                    let result = if power == "on" {
-                                        bulb.set_power(&mgr.sock, PowerLevel::Enabled)
-                                    } else {
-                                        bulb.set_power(&mgr.sock, PowerLevel::Standby)
-                                    };
-                                    
-                                    if result.is_err() {
-                                        status = "error";
-                                    }
-                                }
-                                
-                                // Apply color if specified
-                                if let Some(ref color_str) = state_update.color {
-                                    // Reuse existing color parsing logic
-                                    let mut kelvin = bulb.lifx_color.as_ref().map_or(6500, |c| c.kelvin);
-                                    let mut brightness = bulb.lifx_color.as_ref().map_or(LIFX_BRIGHTNESS_MAX as u16, |c| c.brightness);
-                                    let mut saturation = bulb.lifx_color.as_ref().map_or(0, |c| c.saturation);
-                                    let mut hue = bulb.lifx_color.as_ref().map_or(0, |c| c.hue);
-                                    let duration = state_update.duration.unwrap_or(0.0) as u32;
-                                    
-                                    // Parse color string and update HSBK values
-                                    let hsbk = if color_str.starts_with("kelvin:") {
-                                        let k = color_str.strip_prefix("kelvin:").unwrap_or("6500").parse::<u16>().unwrap_or(6500);
-                                        HSBK { hue, saturation: 0, brightness, kelvin: k }
-                                    } else if color_str.starts_with("hue:") {
-                                        let h = color_str.strip_prefix("hue:").unwrap_or("0").parse::<u16>().unwrap_or(0);
-                                        HSBK { hue: h, saturation, brightness, kelvin }
-                                    } else if color_str.starts_with("brightness:") {
-                                        let b = color_str.strip_prefix("brightness:").unwrap_or("1.0").parse::<f64>().unwrap_or(1.0);
-                                        HSBK { hue, saturation, brightness: (b as f32 * LIFX_BRIGHTNESS_MAX) as u16, kelvin }
-                                    } else if color_str.starts_with("saturation:") {
-                                        let s = color_str.strip_prefix("saturation:").unwrap_or("1.0").parse::<f64>().unwrap_or(1.0);
-                                        HSBK { hue, saturation: (s as f32 * LIFX_SATURATION_MAX) as u16, brightness, kelvin }
-                                    } else {
-                                        // Handle named colors
-                                        match color_str.as_str() {
-                                            "white" => HSBK { hue: 0, saturation: 0, brightness, kelvin },
-                                            "red" => HSBK { hue: HUE_RED, saturation: LIFX_SATURATION_MAX as u16, brightness, kelvin },
-                                            "orange" => HSBK { hue: HUE_ORANGE, saturation: LIFX_SATURATION_MAX as u16, brightness, kelvin },
-                                            "yellow" => HSBK { hue: HUE_YELLOW, saturation: LIFX_SATURATION_MAX as u16, brightness, kelvin },
-                                            "cyan" => HSBK { hue: HUE_CYAN, saturation: LIFX_SATURATION_MAX as u16, brightness, kelvin },
-                                            "green" => HSBK { hue: HUE_GREEN, saturation: LIFX_SATURATION_MAX as u16, brightness, kelvin },
-                                            "blue" => HSBK { hue: HUE_BLUE, saturation: LIFX_SATURATION_MAX as u16, brightness, kelvin },
-                                            "purple" => HSBK { hue: HUE_PURPLE, saturation: LIFX_SATURATION_MAX as u16, brightness, kelvin },
-                                            "pink" => HSBK { hue: HUE_PINK, saturation: 25000, brightness, kelvin },
-                                            _ => HSBK { hue, saturation, brightness, kelvin }
-                                        }
-                                    };
-                                    
-                                    if bulb.set_color(&mgr.sock, hsbk, duration).is_err() {
-                                        status = "error";
-                                    }
-                                }
-                                
-                                // Apply brightness if specified independently
-                                if state_update.color.is_none() && state_update.brightness.is_some() {
-                                    let brightness_val = match state_update.brightness {
-                                        Some(b) => b,
-                                        None => {
-                                            results.push(StateResult {
-                                                id: bulb.id.clone(),
-                                                label: bulb.label.clone(),
-                                                status: "error".to_string(),
-                                            });
-                                            continue;
-                                        }
-                                    };
-                                    let duration = state_update.duration.unwrap_or(0.0) as u32;
-                                    
-                                    let mut kelvin = bulb.lifx_color.as_ref().map_or(6500, |c| c.kelvin);
-                                    let mut saturation = bulb.lifx_color.as_ref().map_or(0, |c| c.saturation);
-                                    let mut hue = bulb.lifx_color.as_ref().map_or(0, |c| c.hue);
-                                    
-                                    let hsbk = HSBK {
-                                        hue,
-                                        saturation,
-                                        brightness: (brightness_val as f32 * LIFX_BRIGHTNESS_MAX) as u16,
-                                        kelvin,
-                                    };
-                                    
-                                    if bulb.set_color(&mgr.sock, hsbk, duration).is_err() {
-                                        status = "error";
-                                    }
-                                }
-                                
-                                // Apply infrared if specified
-                                if let Some(infrared) = state_update.infrared {
-                                    let ir_brightness = (infrared as f32 * LIFX_BRIGHTNESS_MAX) as u16;
-                                    if bulb.set_infrared(&mgr.sock, ir_brightness).is_err() {
-                                        status = "error";
-                                    }
-                                }
-                                
-                                results.push(StateResult {
-                                    id: bulb.id.clone(),
-                                    label: bulb.label.clone(),
-                                    status: status.to_string(),
-                                });
-                            }
+                        for bulb in bulbs.values() {
+                            println!("{:?}", *bulb);
+                            bulbs_vec.push(bulb);
                         }
-
-                        response = Response::json(&StatesResponse { results });
-                    }
+        
+                        if selector == "all"{
+                        
+                        }
+        
+                        if selector.contains("group_id:"){
+                            bulbs_vec = bulbs_vec
+                            .into_iter()
+                            .filter(|b| b.lifx_group.as_ref().map_or(false, |g| g.id.contains(&selector.replace("group_id:", ""))))
+                            .collect();
+                        }
+        
+                        if selector.contains("location_id:"){
+                            bulbs_vec = bulbs_vec
+                            .into_iter()
+                            .filter(|b| b.lifx_location.as_ref().map_or(false, |l| l.id.contains(&selector.replace("location_id:", ""))))
+                            .collect();
+                        }
+        
+                        if selector.contains("id:"){
+                            bulbs_vec = bulbs_vec
+                            .into_iter()
+                            .filter(|b| b.id.contains(&selector.replace("id:", "")))
+                            .collect();
+                        }
         
                     // (PUT) SetState
                     // https://api.lifx.com/v1/lights/:selector/state
@@ -1611,11 +1448,12 @@ pub fn start(config: Config) {
                     }
         
         
-                    // ListLights
-                    // https://api.lifx.com/v1/lights/:selector
-                    if request.url().contains("/v1/lights/") && !request.url().contains("/state"){
-                        response = Response::json(&bulbs_vec.clone());
-                    }
+                        // ListLights
+                        // https://api.lifx.com/v1/lights/:selector
+                        if request.url().contains("/v1/lights/") && !request.url().contains("/state"){
+                            response = Response::json(&bulbs_vec.clone());
+                        }
+                    } // Close the else block here
         
         
                     // Mutex locks will be automatically dropped when they go out of scope
