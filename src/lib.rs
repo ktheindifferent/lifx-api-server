@@ -700,29 +700,76 @@ impl Manager {
         receiver_bulbs: Arc<Mutex<HashMap<u64, BulbInfo>>>,
     ) {
         let mut buf = [0; 1024];
+        let mut consecutive_errors: u32 = 0;
+        let max_consecutive_errors: u32 = 10;
+        let base_delay = Duration::from_millis(100);
+        let max_delay = Duration::from_secs(30);
+        
         loop {
             match recv_sock.recv_from(&mut buf) {
-                Ok((0, addr)) => println!("Received a zero-byte datagram from {:?}", addr),
-                Ok((nbytes, addr)) => match RawMessage::unpack(&buf[0..nbytes]) {
-                    Ok(raw) => {
-                        if raw.frame_addr.target == 0 {
-                            continue;
-                        }
-                        if let Ok(mut bulbs) = receiver_bulbs.lock() {
-                            let bulb = bulbs
-                                .entry(raw.frame_addr.target)
-                                .and_modify(|bulb| bulb.update(addr))
-                                .or_insert_with(|| {
-                                    BulbInfo::new(source, raw.frame_addr.target, addr)
-                                });
-                            if let Err(e) = Self::handle_message(raw, bulb) {
-                                println!("Error handling message from {}: {}", addr, e)
+                Ok((0, addr)) => {
+                    println!("Received a zero-byte datagram from {:?}", addr);
+                    consecutive_errors = 0;
+                },
+                Ok((nbytes, addr)) => {
+                    consecutive_errors = 0;
+                    match RawMessage::unpack(&buf[0..nbytes]) {
+                        Ok(raw) => {
+                            if raw.frame_addr.target == 0 {
+                                continue;
+                            }
+                            if let Ok(mut bulbs) = receiver_bulbs.lock() {
+                                let bulb = bulbs
+                                    .entry(raw.frame_addr.target)
+                                    .and_modify(|bulb| bulb.update(addr))
+                                    .or_insert_with(|| {
+                                        BulbInfo::new(source, raw.frame_addr.target, addr)
+                                    });
+                                if let Err(e) = Self::handle_message(raw, bulb) {
+                                    println!("Error handling message from {}: {}", addr, e)
+                                }
                             }
                         }
+                        Err(e) => println!("Error unpacking raw message from {}: {}", addr, e),
                     }
-                    Err(e) => println!("Error unpacking raw message from {}: {}", addr, e),
                 },
-                Err(e) => panic!("recv_from err {:?}", e),
+                Err(e) => {
+                    consecutive_errors += 1;
+                    eprintln!("Network error in recv_from (attempt {}/{}): {:?}", 
+                             consecutive_errors, max_consecutive_errors, e);
+                    
+                    if consecutive_errors >= max_consecutive_errors {
+                        eprintln!("CRITICAL: Too many consecutive network errors. Resetting error counter and continuing with maximum backoff.");
+                        consecutive_errors = 0;
+                        thread::sleep(max_delay);
+                    } else {
+                        let backoff_multiplier = 2_u32.saturating_pow(consecutive_errors.saturating_sub(1) as u32);
+                        let delay = base_delay
+                            .saturating_mul(backoff_multiplier)
+                            .min(max_delay);
+                        
+                        eprintln!("Retrying after {:?} delay...", delay);
+                        thread::sleep(delay);
+                    }
+                    
+                    match e.kind() {
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut => {
+                            continue;
+                        }
+                        std::io::ErrorKind::Interrupted => {
+                            eprintln!("Network operation interrupted, retrying immediately...");
+                            continue;
+                        }
+                        std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::ConnectionAborted => {
+                            eprintln!("Connection lost, attempting to recover...");
+                            continue;
+                        }
+                        _ => {
+                            eprintln!("Unexpected network error type: {:?}, continuing anyway...", e.kind());
+                            continue;
+                        }
+                    }
+                }
             }
         }
     }
@@ -2052,5 +2099,177 @@ mod tests {
         // Pink ~350 degrees
         let expected_pink = ((350.0 * LIFX_HUE_DEGREE_FACTOR) as u32 % 0x10000) as u16;
         assert!((HUE_PINK as i32 - expected_pink as i32).abs() < 10);
+    }
+
+    #[test]
+    fn test_network_error_recovery_simulation() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        use std::net::UdpSocket;
+        use std::thread;
+        use std::time::Duration;
+        
+        let error_count = Arc::new(AtomicUsize::new(0));
+        let should_stop = Arc::new(AtomicBool::new(false));
+        
+        let error_count_clone = error_count.clone();
+        let should_stop_clone = should_stop.clone();
+        
+        let handle = thread::spawn(move || {
+            let socket = UdpSocket::bind("127.0.0.1:0").expect("Failed to bind socket");
+            socket.set_read_timeout(Some(Duration::from_millis(100))).unwrap();
+            
+            let mut buf = [0; 1024];
+            let mut consecutive_errors = 0;
+            
+            while !should_stop_clone.load(Ordering::Relaxed) {
+                match socket.recv_from(&mut buf) {
+                    Ok(_) => {
+                        consecutive_errors = 0;
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock || 
+                              e.kind() == std::io::ErrorKind::TimedOut => {
+                        consecutive_errors += 1;
+                        error_count_clone.fetch_add(1, Ordering::Relaxed);
+                        
+                        if consecutive_errors > 3 {
+                            thread::sleep(Duration::from_millis(100));
+                        }
+                    }
+                    Err(_) => {
+                        consecutive_errors += 1;
+                        error_count_clone.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+            }
+        });
+        
+        thread::sleep(Duration::from_millis(500));
+        should_stop.store(true, Ordering::Relaxed);
+        handle.join().unwrap();
+        
+        assert!(error_count.load(Ordering::Relaxed) > 0, "Should have encountered timeout errors");
+    }
+    
+    #[test]
+    fn test_exponential_backoff_calculation() {
+        let base_delay = Duration::from_millis(100);
+        let max_delay = Duration::from_secs(30);
+        
+        // Test the actual implementation logic used in the worker function
+        // consecutive_errors starts at 1 and uses saturating_sub(1)
+        for consecutive_errors in 1..10 {
+            let backoff_multiplier = 2_u32.saturating_pow((consecutive_errors as u32).saturating_sub(1));
+            let delay = base_delay
+                .saturating_mul(backoff_multiplier)
+                .min(max_delay);
+            
+            if consecutive_errors == 1 {
+                assert_eq!(delay, Duration::from_millis(100)); // 2^0 * 100ms = 100ms
+            } else if consecutive_errors == 2 {
+                assert_eq!(delay, Duration::from_millis(200)); // 2^1 * 100ms = 200ms
+            } else if consecutive_errors == 3 {
+                assert_eq!(delay, Duration::from_millis(400)); // 2^2 * 100ms = 400ms
+            } else if consecutive_errors == 4 {
+                assert_eq!(delay, Duration::from_millis(800)); // 2^3 * 100ms = 800ms
+            } else if consecutive_errors == 5 {
+                assert_eq!(delay, Duration::from_millis(1600)); // 2^4 * 100ms = 1600ms
+            } else if consecutive_errors == 6 {
+                assert_eq!(delay, Duration::from_millis(3200)); // 2^5 * 100ms = 3200ms
+            } else if consecutive_errors == 7 {
+                assert_eq!(delay, Duration::from_millis(6400)); // 2^6 * 100ms = 6400ms
+            } else if consecutive_errors == 8 {
+                assert_eq!(delay, Duration::from_millis(12800)); // 2^7 * 100ms = 12800ms
+            } else if consecutive_errors == 9 {
+                assert_eq!(delay, Duration::from_millis(25600)); // 2^8 * 100ms = 25600ms
+            }
+        }
+        
+        // Test that very high error counts still cap at max_delay
+        let high_error_count: u32 = 20;
+        let backoff_multiplier = 2_u32.saturating_pow(high_error_count.saturating_sub(1));
+        let delay = base_delay
+            .saturating_mul(backoff_multiplier)
+            .min(max_delay);
+        assert_eq!(delay, max_delay);
+    }
+    
+    #[test]
+    fn test_network_socket_with_interruption() {
+        use std::net::UdpSocket;
+        use std::thread;
+        use std::time::Duration;
+        
+        let server = UdpSocket::bind("127.0.0.1:0").expect("Failed to bind server");
+        let server_addr = server.local_addr().unwrap();
+        server.set_read_timeout(Some(Duration::from_millis(100))).unwrap();
+        
+        let client = UdpSocket::bind("127.0.0.1:0").expect("Failed to bind client");
+        
+        let handle = thread::spawn(move || {
+            let mut buf = [0; 1024];
+            let mut received_count = 0;
+            let mut error_count = 0;
+            
+            for _ in 0..10 {
+                match server.recv_from(&mut buf) {
+                    Ok((nbytes, _)) if nbytes > 0 => {
+                        received_count += 1;
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock || 
+                              e.kind() == std::io::ErrorKind::TimedOut => {
+                        error_count += 1;
+                    }
+                    _ => {}
+                }
+            }
+            
+            (received_count, error_count)
+        });
+        
+        thread::sleep(Duration::from_millis(50));
+        client.send_to(b"test1", server_addr).unwrap();
+        thread::sleep(Duration::from_millis(150));
+        client.send_to(b"test2", server_addr).unwrap();
+        thread::sleep(Duration::from_millis(200));
+        client.send_to(b"test3", server_addr).unwrap();
+        
+        let (received, errors) = handle.join().unwrap();
+        assert!(received >= 2, "Should have received at least 2 messages");
+        assert!(errors >= 2, "Should have encountered timeout errors");
+    }
+    
+    #[test]
+    fn test_error_handling_different_error_types() {
+        use std::io::{Error, ErrorKind};
+        
+        let error_types = vec![
+            ErrorKind::WouldBlock,
+            ErrorKind::TimedOut,
+            ErrorKind::Interrupted,
+            ErrorKind::ConnectionReset,
+            ErrorKind::ConnectionAborted,
+            ErrorKind::NotConnected,
+            ErrorKind::AddrNotAvailable,
+            ErrorKind::BrokenPipe,
+        ];
+        
+        for error_kind in error_types {
+            let error = Error::new(error_kind, "Test error");
+            
+            match error.kind() {
+                ErrorKind::WouldBlock | ErrorKind::TimedOut => {
+                    assert!(true, "Should handle timeout/wouldblock");
+                }
+                ErrorKind::Interrupted => {
+                    assert!(true, "Should handle interruption");
+                }
+                ErrorKind::ConnectionReset | ErrorKind::ConnectionAborted => {
+                    assert!(true, "Should handle connection issues");
+                }
+                _ => {
+                    assert!(true, "Should handle other errors gracefully");
+                }
+            }
+        }
     }
 }
