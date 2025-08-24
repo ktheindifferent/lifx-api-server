@@ -1,5 +1,3 @@
-#![feature(mutex_unlock)]
-
 [package]
 name = "lifx-api-server"
 description = "A library/server that mimicks the official LIFX API using the local LAN protocol."
