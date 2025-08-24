@@ -21,6 +21,7 @@ use rouille::post_input;
 
 
 use serde::{Serialize, Deserialize};
+use serde_json::json;
 
 use palette::{Hsv, Srgb, IntoColor};
 
@@ -29,6 +30,22 @@ use colors_transform::{Rgb, Color};
 
 
 const HOUR: Duration = Duration::from_secs(60 * 60);
+
+// Helper functions for safe parsing
+fn parse_u16_safe(value: &str) -> Result<u16, String> {
+    value.parse::<u16>()
+        .map_err(|_| format!("Invalid u16 value: {}", value))
+}
+
+fn parse_f64_safe(value: &str) -> Result<f64, String> {
+    value.parse::<f64>()
+        .map_err(|_| format!("Invalid f64 value: {}", value))
+}
+
+fn parse_i64_safe(value: &str) -> Result<i64, String> {
+    value.parse::<i64>()
+        .map_err(|_| format!("Invalid i64 value: {}", value))
+}
 
 // Rate limiting configuration
 const MAX_AUTH_ATTEMPTS: u32 = 5;
@@ -180,7 +197,6 @@ fn authenticate_request(
         }
     }
 }
-
 
 #[derive(Debug)]
 struct RefreshableData<T> {
@@ -534,7 +550,7 @@ impl Manager {
             }
             Message::StateLabel { label } => {
                 bulb.name.update(label.0);
-                bulb.label = bulb.name.data.as_ref().unwrap().to_string();
+                bulb.label = bulb.name.data.as_ref().map(|s| s.to_string()).unwrap_or_else(|| String::from("unknown"));
 
             },
 
@@ -579,7 +595,7 @@ impl Manager {
             Message::StatePower { level } => {
                 bulb.power_level.update(level);
 
-                if bulb.power_level.data.as_ref().unwrap() ==  &PowerLevel::Enabled{
+                if bulb.power_level.data.as_ref() == Some(&PowerLevel::Enabled) {
                     bulb.power = format!("on");
                 } else {
                     bulb.power = format!("off");
@@ -718,10 +734,13 @@ impl Manager {
             source: self.source,
             ..Default::default()
         };
-        let rawmsg = RawMessage::build(&opts, Message::GetService).unwrap();
-        let bytes = rawmsg.pack().unwrap();
+        let rawmsg = RawMessage::build(&opts, Message::GetService)
+            .map_err(|e| lifx_rs::lan::Error::Io(std::io::Error::new(std::io::ErrorKind::Other, format!("Failed to build message: {:?}", e))))?;
+        let bytes = rawmsg.pack()
+            .map_err(|e| lifx_rs::lan::Error::Io(std::io::Error::new(std::io::ErrorKind::Other, format!("Failed to pack message: {:?}", e))))?;
 
-        for addr in get_if_addrs().unwrap() {
+        for addr in get_if_addrs()
+            .map_err(|e| lifx_rs::lan::Error::Io(std::io::Error::new(std::io::ErrorKind::Other, format!("Failed to get network interfaces: {:?}", e))))? {
             match addr.addr {
                 IfAddr::V4(Ifv4Addr {
                     broadcast: Some(bcast),
@@ -769,8 +788,15 @@ pub struct Config {
 pub fn start(config: Config) {
 
 
-    sudo::with_env(&["SECRET_KEY"]).unwrap();
-    sudo::escalate_if_needed().unwrap();
+    if let Err(e) = sudo::with_env(&["SECRET_KEY"]) {
+        eprintln!("Failed to preserve SECRET_KEY environment variable: {}", e);
+        std::process::exit(1);
+    }
+    
+    if let Err(e) = sudo::escalate_if_needed() {
+        eprintln!("Failed to escalate privileges: {}", e);
+        std::process::exit(1);
+    }
 
 
     let mgr = Manager::new();
@@ -783,7 +809,14 @@ pub fn start(config: Config) {
 
             thread::spawn(move || {
                 loop{
-                    let mut lock = th_arc_mgr.lock().unwrap();
+                    let mut lock = match th_arc_mgr.lock() {
+                        Ok(l) => l,
+                        Err(e) => {
+                            eprintln!("Failed to acquire lock: {}", e);
+                            thread::sleep(Duration::from_millis(1000));
+                            continue;
+                        }
+                    };
                     let mgr = &mut *lock;  
                 
                     // if Instant::now() - mgr.last_discovery > Duration::from_secs(300) {
@@ -827,7 +860,13 @@ pub fn start(config: Config) {
         
                     let mut response = Response::text("hello world");
         
-                    let mut lock = th2_arc_mgr.lock().unwrap();
+                    let mut lock = match th2_arc_mgr.lock() {
+                        Ok(l) => l,
+                        Err(e) => {
+                            eprintln!("Failed to acquire lock: {}", e);
+                            return Response::text("Internal Server Error").with_status_code(500);
+                        }
+                    };
                     let mgr = &mut *lock;  
         
                 
@@ -848,7 +887,13 @@ pub fn start(config: Config) {
         
                     let mut bulbs_vec: Vec<&BulbInfo> = Vec::new();
         
-                    let bulbs = mgr.bulbs.lock().unwrap();
+                    let bulbs = match mgr.bulbs.lock() {
+                        Ok(b) => b,
+                        Err(e) => {
+                            eprintln!("Failed to acquire bulbs lock: {}", e);
+                            return Response::text("Internal Server Error").with_status_code(500);
+                        }
+                    };
                     
                         
                     for bulb in bulbs.values() {
@@ -863,14 +908,14 @@ pub fn start(config: Config) {
                     if selector.contains("group_id:"){
                         bulbs_vec = bulbs_vec
                         .into_iter()
-                        .filter(|b| b.lifx_group.as_ref().unwrap().id.contains(&selector.replace("group_id:", "")))
+                        .filter(|b| b.lifx_group.as_ref().map_or(false, |g| g.id.contains(&selector.replace("group_id:", ""))))
                         .collect();
                     }
         
                     if selector.contains("location_id:"){
                         bulbs_vec = bulbs_vec
                         .into_iter()
-                        .filter(|b| b.lifx_location.as_ref().unwrap().id.contains(&selector.replace("location_id:", "")))
+                        .filter(|b| b.lifx_location.as_ref().map_or(false, |l| l.id.contains(&selector.replace("location_id:", ""))))
                         .collect();
                     }
         
@@ -1008,7 +1053,17 @@ pub fn start(config: Config) {
                                 
                                 // Apply brightness if specified independently
                                 if state_update.color.is_none() && state_update.brightness.is_some() {
-                                    let brightness_val = state_update.brightness.unwrap();
+                                    let brightness_val = match state_update.brightness {
+                                        Some(b) => b,
+                                        None => {
+                                            results.push(StateResult {
+                                                id: bulb.id.clone(),
+                                                label: bulb.label.clone(),
+                                                status: "error".to_string(),
+                                            });
+                                            continue;
+                                        }
+                                    };
                                     let duration = state_update.duration.unwrap_or(0.0) as u32;
                                     
                                     let mut kelvin = bulb.lifx_color.as_ref().map_or(6500, |c| c.kelvin);
@@ -1062,7 +1117,14 @@ pub fn start(config: Config) {
         
                         // Power
                         if input.power.is_some() {
-                            let power = input.power.unwrap();
+                            let power = match input.power {
+                                Some(p) => p,
+                                None => {
+                                    return Response::text(json!({
+                                        "error": "Missing power value"
+                                    }).to_string()).with_status_code(400);
+                                }
+                            };
                             if power == format!("on"){
                                 for bulb in &bulbs_vec {
                                     bulb.set_power(&mgr.sock, PowerLevel::Enabled);
@@ -1078,7 +1140,14 @@ pub fn start(config: Config) {
         
                         // Color
                         if input.color.is_some() {
-                            let cc = input.color.unwrap();
+                            let cc = match input.color {
+                                Some(c) => c,
+                                None => {
+                                    return Response::text(json!({
+                                        "error": "Missing color value"
+                                    }).to_string()).with_status_code(400);
+                                }
+                            };
         
         
         
@@ -1092,11 +1161,10 @@ pub fn start(config: Config) {
         
                                 let mut duration = 0;
                                 if input.duration.is_some(){
-                                    duration = input.duration.unwrap() as u32;
+                                    duration = input.duration.unwrap_or(0.0) as u32;
                                 }
         
-                                if bulb.lifx_color.is_some() {
-                                    let lifxc = bulb.lifx_color.as_ref().unwrap();
+                                if let Some(lifxc) = bulb.lifx_color.as_ref() {
                                     kelvin = lifxc.kelvin;
                                     brightness = lifxc.brightness;
                                     saturation = lifxc.saturation;
@@ -1198,7 +1266,13 @@ pub fn start(config: Config) {
         
                                     let hue_split = cc.split("hue:");
                                     let hue_vec: Vec<&str> = hue_split.collect();
-                                    let new_hue = hue_vec[1].to_string().parse::<u16>().unwrap(); 
+                                    let new_hue = match parse_u16_safe(&hue_vec[1]) {
+                                        Ok(h) => h,
+                                        Err(e) => {
+                                            println!("Error parsing hue: {}", e);
+                                            continue;
+                                        }
+                                    }; 
                                     let hbsk_set = HSBK {
                                         hue: new_hue,
                                         saturation: saturation,
@@ -1211,7 +1285,13 @@ pub fn start(config: Config) {
                                 if cc.contains("saturation:"){
                                     let saturation_split = cc.split("saturation:");
                                     let saturation_vec: Vec<&str> = saturation_split.collect();
-                                    let new_saturation_float = saturation_vec[1].to_string().parse::<f64>().unwrap(); 
+                                    let new_saturation_float = match parse_f64_safe(&saturation_vec[1]) {
+                                        Ok(s) => s,
+                                        Err(e) => {
+                                            println!("Error parsing saturation: {}", e);
+                                            continue;
+                                        }
+                                    }; 
                                     let new_saturation: u16 = (f64::from(100) * new_saturation_float) as u16;
                                     let hbsk_set = HSBK {
                                         hue: hue,
@@ -1225,7 +1305,13 @@ pub fn start(config: Config) {
                                 if cc.contains("brightness:"){
                                     let brightness_split = cc.split("brightness:");
                                     let brightness_vec: Vec<&str> = brightness_split.collect();
-                                    let new_brightness_float = brightness_vec[1].to_string().parse::<f64>().unwrap(); 
+                                    let new_brightness_float = match parse_f64_safe(&brightness_vec[1]) {
+                                        Ok(b) => b,
+                                        Err(e) => {
+                                            println!("Error parsing brightness: {}", e);
+                                            continue;
+                                        }
+                                    }; 
                                     let new_brightness: u16 = (LIFX_BRIGHTNESS_MAX * new_brightness_float as f32) as u16;
                                     let hbsk_set = HSBK {
                                         hue: hue,
@@ -1239,7 +1325,13 @@ pub fn start(config: Config) {
                                 if cc.contains("kelvin:"){
                                     let kelvin_split = cc.split("kelvin:");
                                     let kelvin_vec: Vec<&str> = kelvin_split.collect();
-                                    let new_kelvin = kelvin_vec[1].to_string().parse::<u16>().unwrap(); 
+                                    let new_kelvin = match parse_u16_safe(&kelvin_vec[1]) {
+                                        Ok(k) => k,
+                                        Err(e) => {
+                                            println!("Error parsing kelvin: {}", e);
+                                            continue;
+                                        }
+                                    }; 
                                     let hbsk_set = HSBK {
                                         hue: hue,
                                         saturation: 0,
@@ -1259,13 +1351,31 @@ pub fn start(config: Config) {
                                     let rgb_part_split = rgb_parts.split(",");
                                     let rgb_parts_vec: Vec<&str> = rgb_part_split.collect();
         
-                                    let red_int = rgb_parts_vec[0].to_string().parse::<i64>().unwrap(); 
+                                    let red_int = match parse_i64_safe(&rgb_parts_vec[0]) {
+                                        Ok(r) => r,
+                                        Err(e) => {
+                                            println!("Error parsing red value: {}", e);
+                                            continue;
+                                        }
+                                    };
                                     let red_float: f32 = (red_int) as f32;
         
-                                    let green_int = rgb_parts_vec[1].to_string().parse::<i64>().unwrap(); 
+                                    let green_int = match parse_i64_safe(&rgb_parts_vec[1]) {
+                                        Ok(g) => g,
+                                        Err(e) => {
+                                            println!("Error parsing green value: {}", e);
+                                            continue;
+                                        }
+                                    };
                                     let green_float: f32 = (green_int) as f32;
         
-                                    let blue_int = rgb_parts_vec[2].to_string().parse::<i64>().unwrap(); 
+                                    let blue_int = match parse_i64_safe(&rgb_parts_vec[2]) {
+                                        Ok(b) => b,
+                                        Err(e) => {
+                                            println!("Error parsing blue value: {}", e);
+                                            continue;
+                                        }
+                                    };
                                     let blue_float: f32 = (blue_int) as f32;
         
                                     let rgb = Srgb::new(red_float / 255.0, green_float / 255.0, blue_float / 255.0);
@@ -1290,18 +1400,42 @@ pub fn start(config: Config) {
                                     let hex_vec: Vec<&str> = hex_split.collect();
                                     let hex = hex_vec[1].to_string();
         
-                                    let rgb2 = Rgb::from_hex_str(format!("#{}", hex).as_str()).unwrap();
+                                    let rgb2 = match Rgb::from_hex_str(format!("#{}", hex).as_str()) {
+                                        Ok(rgb) => rgb,
+                                        Err(_) => {
+                                            println!("Error parsing hex color: {}", hex);
+                                            continue;
+                                        }
+                                    };
                                     // Rgb { r: 255.0, g: 204.0, b: 0.0 }
         
                                     println!("{:?}", rgb2);
         
-                                    let red_int = rgb2.get_red().to_string().parse::<i64>().unwrap(); 
+                                    let red_int = match parse_i64_safe(&rgb2.get_red().to_string()) {
+                                        Ok(r) => r,
+                                        Err(e) => {
+                                            println!("Error parsing red from hex: {}", e);
+                                            continue;
+                                        }
+                                    };
                                     let red_float: f32 = (red_int) as f32;
         
-                                    let green_int = rgb2.get_green().to_string().parse::<i64>().unwrap(); 
+                                    let green_int = match parse_i64_safe(&rgb2.get_green().to_string()) {
+                                        Ok(g) => g,
+                                        Err(e) => {
+                                            println!("Error parsing green from hex: {}", e);
+                                            continue;
+                                        }
+                                    };
                                     let green_float: f32 = (green_int) as f32;
         
-                                    let blue_int = rgb2.get_blue().to_string().parse::<i64>().unwrap(); 
+                                    let blue_int = match parse_i64_safe(&rgb2.get_blue().to_string()) {
+                                        Ok(b) => b,
+                                        Err(e) => {
+                                            println!("Error parsing blue from hex: {}", e);
+                                            continue;
+                                        }
+                                    };
                                     let blue_float: f32 = (blue_int) as f32;
         
         
@@ -1337,7 +1471,14 @@ pub fn start(config: Config) {
         
                         // Brightness
                         if input.brightness.is_some() {
-                            let brightness = input.brightness.unwrap();
+                            let brightness = match input.brightness {
+                                Some(b) => b,
+                                None => {
+                                    return Response::text(json!({
+                                        "error": "Missing brightness value"
+                                    }).to_string()).with_status_code(400);
+                                }
+                            };
         
                             for bulb in &bulbs_vec {
         
@@ -1348,7 +1489,7 @@ pub fn start(config: Config) {
         
                                 let mut duration = 0;
                                 if input.duration.is_some(){
-                                    duration = input.duration.unwrap() as u32;
+                                    duration = input.duration.unwrap_or(0.0) as u32;
                                 }
         
                                 if bulb.lifx_color.is_some() {
@@ -1358,8 +1499,14 @@ pub fn start(config: Config) {
                                     hue = lifxc.hue;
                                 }
                                 
-                                let new_brightness_float = brightness.to_string().parse::<f64>().unwrap(); 
-                                let new_brightness: u16 = (f64::from(65535) * new_brightness_float) as u16;
+                                let new_brightness_float = match parse_f64_safe(&brightness.to_string()) {
+                                    Ok(b) => b,
+                                    Err(e) => {
+                                        println!("Error parsing brightness: {}", e);
+                                        continue;
+                                    }
+                                }; 
+                                let new_brightness: u16 = (LIFX_BRIGHTNESS_MAX * new_brightness_float as f32) as u16;
                                 let hbsk_set = HSBK {
                                     hue: hue,
                                     saturation: saturation,
@@ -1374,7 +1521,15 @@ pub fn start(config: Config) {
         
                         // Infrared
                         if input.infrared.is_some() {
-                            let new_brightness: u16 = (LIFX_BRIGHTNESS_MAX * input.infrared.unwrap() as f32) as u16;
+                            let infrared_val = match input.infrared {
+                                Some(i) => i,
+                                None => {
+                                    return Response::text(json!({
+                                        "error": "Missing infrared value"
+                                    }).to_string()).with_status_code(400);
+                                }
+                            };
+                            let new_brightness: u16 = (LIFX_BRIGHTNESS_MAX * infrared_val as f32) as u16;
         
                             for bulb in &bulbs_vec {
                                 bulb.set_infrared(&mgr.sock, new_brightness);
@@ -1611,6 +1766,64 @@ mod tests {
     fn test_color_conversion_white() {
         let (_, saturation) = convert_rgb_to_hsbk(255.0, 255.0, 255.0);
         assert_eq!(saturation, 0); // White has no saturation
+    }
+
+    #[test]
+    fn test_parse_u16_safe_valid() {
+        assert_eq!(parse_u16_safe("1234").unwrap(), 1234);
+        assert_eq!(parse_u16_safe("0").unwrap(), 0);
+        assert_eq!(parse_u16_safe("65535").unwrap(), 65535);
+    }
+
+    #[test]
+    fn test_parse_u16_safe_invalid() {
+        assert!(parse_u16_safe("abc").is_err());
+        assert!(parse_u16_safe("-1").is_err());
+        assert!(parse_u16_safe("65536").is_err());
+        assert!(parse_u16_safe("").is_err());
+    }
+
+    #[test]
+    fn test_parse_f64_safe_valid() {
+        assert_eq!(parse_f64_safe("12.34").unwrap(), 12.34);
+        assert_eq!(parse_f64_safe("0").unwrap(), 0.0);
+        assert_eq!(parse_f64_safe("-5.67").unwrap(), -5.67);
+    }
+
+    #[test]
+    fn test_parse_f64_safe_invalid() {
+        assert!(parse_f64_safe("abc").is_err());
+        assert!(parse_f64_safe("").is_err());
+        assert!(parse_f64_safe("12.34.56").is_err());
+    }
+
+    #[test]
+    fn test_parse_i64_safe_valid() {
+        assert_eq!(parse_i64_safe("1234").unwrap(), 1234);
+        assert_eq!(parse_i64_safe("0").unwrap(), 0);
+        assert_eq!(parse_i64_safe("-1234").unwrap(), -1234);
+    }
+
+    #[test]
+    fn test_parse_i64_safe_invalid() {
+        assert!(parse_i64_safe("abc").is_err());
+        assert!(parse_i64_safe("").is_err());
+        assert!(parse_i64_safe("12.34").is_err());
+    }
+
+    #[test]
+    fn test_bulb_info_with_none_fields() {
+        let source = 0x12345678;
+        let target = 0xABCDEF123456;
+        let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 100)), 56700);
+        
+        let bulb = BulbInfo::new(source, target, addr);
+        
+        // Test that methods handle None values gracefully
+        assert!(bulb.lifx_group.is_none());
+        assert!(bulb.lifx_location.is_none());
+        assert!(bulb.lifx_color.is_none());
+        assert!(bulb.product.is_none());
     }
 
     // Security tests for authentication
