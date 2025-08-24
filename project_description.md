@@ -15,7 +15,7 @@ This is a Rust library/server that emulates the official LIFX API using the loca
 ### API Endpoints Implemented
 - **GET /v1/lights/:selector** - List lights matching selector (all, id:xxx, group_id:xxx, location_id:xxx)
 - **PUT /v1/lights/:selector/state** - Set state of lights (power, color, brightness, duration, infrared)
-- **PUT /v1/lights/states** - Set states for multiple lights (TODO - partially implemented)
+- **PUT /v1/lights/states** - Set states for multiple lights (fully implemented with retry logic and validation)
 
 ### Color Control Features
 - Named colors (white, red, orange, yellow, cyan, green, blue, purple, pink)
@@ -45,11 +45,20 @@ This is a Rust library/server that emulates the official LIFX API using the loca
 
 ### Current Limitations
 - Requires sudo privileges for network operations
-- SetStates endpoint not fully implemented
 - No support for LIFX Effects, Scenes, Clean, Cycle operations yet
 - No extended API for device label changes or WiFi configuration
 
 ### Recent Work
-- Project structure analysis completed
-- Documentation framework established
-- Test infrastructure planning initiated
+- **SetStates Endpoint Implementation** - Completed full implementation with:
+  - Request validation for all parameters
+  - Retry logic with exponential backoff (up to 3 attempts)
+  - Support for defaults field to apply common settings
+  - Detailed per-bulb status reporting
+  - Support for all color formats (RGB, hex, HSB, kelvin, named colors)
+  - Comprehensive error handling and reporting
+- **Test Suite** - Added comprehensive test coverage:
+  - 10 unit tests for state validation and parsing
+  - 9 integration tests for complex scenarios
+  - Tests cover validation, defaults, multiple selectors, and color formats
+- **API Documentation** - Created detailed API documentation with examples
+- **Code Refactoring** - Modularized SetStates logic into separate module for maintainability
