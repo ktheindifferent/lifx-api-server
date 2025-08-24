@@ -3,8 +3,15 @@ use std::env;
 
 fn main() {
 
-    sudo::with_env(&["SECRET_KEY"]).unwrap();
-    sudo::escalate_if_needed().unwrap();
+    if let Err(e) = sudo::with_env(&["SECRET_KEY"]) {
+        eprintln!("Failed to preserve SECRET_KEY environment variable: {}", e);
+        std::process::exit(1);
+    }
+    
+    if let Err(e) = sudo::escalate_if_needed() {
+        eprintln!("Failed to escalate privileges: {}", e);
+        std::process::exit(1);
+    }
 
  
     let secret_key = env::var("SECRET_KEY").expect("$SECRET_KEY is not set");
