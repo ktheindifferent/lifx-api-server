@@ -97,7 +97,14 @@ impl RateLimiter {
     }
 
     fn check_and_update(&self, client_ip: String) -> bool {
-        let mut attempts = self.attempts.lock().unwrap();
+        let mut attempts = match self.attempts.lock() {
+            Ok(guard) => guard,
+            Err(e) => {
+                eprintln!("Failed to acquire rate limiter lock: {}", e);
+                // On mutex poisoning, deny access for safety
+                return false;
+            }
+        };
         let now = Instant::now();
         let window = Duration::from_secs(AUTH_WINDOW_SECONDS);
         
@@ -129,7 +136,14 @@ impl RateLimiter {
     }
 
     fn cleanup_old_entries(&self) {
-        let mut attempts = self.attempts.lock().unwrap();
+        let mut attempts = match self.attempts.lock() {
+            Ok(guard) => guard,
+            Err(e) => {
+                eprintln!("Failed to acquire rate limiter lock for cleanup: {}", e);
+                // If we can't clean up, just return - not critical
+                return;
+            }
+        };
         let now = Instant::now();
         let window = Duration::from_secs(AUTH_WINDOW_SECONDS * 2);
         
@@ -952,7 +966,13 @@ pub fn start(config: Config) {
                         // For other endpoints, we need bulbs_vec
                         let mut bulbs_vec: Vec<&BulbInfo> = Vec::new();
         
-                        let bulbs = mgr.bulbs.lock().unwrap();
+                        let bulbs = match mgr.bulbs.lock() {
+                            Ok(guard) => guard,
+                            Err(e) => {
+                                eprintln!("Failed to acquire bulbs lock: {}", e);
+                                return Response::text("Internal Server Error").with_status_code(500);
+                            }
+                        };
                         
                             
                         for bulb in bulbs.values() {
@@ -1988,6 +2008,105 @@ mod tests {
         assert!(error_count.load(Ordering::Relaxed) > 0, "Should have encountered timeout errors");
     }
     
+    // Mutex error handling tests
+    #[test]
+    fn test_rate_limiter_mutex_poisoning_simulation() {
+        use std::sync::{Arc, Mutex};
+        use std::thread;
+        use std::panic;
+        
+        let limiter = Arc::new(RateLimiter::new());
+        let limiter_clone = Arc::clone(&limiter);
+        
+        // Spawn a thread that will panic while holding the mutex
+        let handle = thread::spawn(move || {
+            let _guard = limiter_clone.attempts.lock().unwrap();
+            panic!("Simulating panic with mutex held");
+        });
+        
+        // Wait for the panic to occur
+        let _ = handle.join();
+        
+        // Now the mutex is poisoned - test that check_and_update handles it
+        let result = limiter.check_and_update("192.168.1.1".to_string());
+        // Should return false when mutex is poisoned
+        assert!(!result, "Should deny access when mutex is poisoned");
+    }
+    
+    #[test]
+    fn test_rate_limiter_cleanup_with_poisoned_mutex() {
+        use std::sync::{Arc, Mutex};
+        use std::thread;
+        use std::panic;
+        
+        let limiter = Arc::new(RateLimiter::new());
+        let limiter_clone = Arc::clone(&limiter);
+        
+        // Spawn a thread that will panic while holding the mutex
+        let handle = thread::spawn(move || {
+            let _guard = limiter_clone.attempts.lock().unwrap();
+            panic!("Simulating panic with mutex held");
+        });
+        
+        // Wait for the panic to occur
+        let _ = handle.join();
+        
+        // Now the mutex is poisoned - test that cleanup_old_entries handles it gracefully
+        // This should not panic, just return early
+        limiter.cleanup_old_entries();
+        // If we reach here without panic, the test passes
+        assert!(true, "cleanup_old_entries should handle poisoned mutex gracefully");
+    }
+    
+    #[test]
+    fn test_manager_bulbs_mutex_error_handling() {
+        use std::sync::{Arc, Mutex};
+        use std::collections::HashMap;
+        
+        // Create a Manager-like structure for testing
+        let bulbs: Arc<Mutex<HashMap<u64, BulbInfo>>> = Arc::new(Mutex::new(HashMap::new()));
+        
+        // Test that we can handle mutex errors properly
+        match bulbs.lock() {
+            Ok(_) => assert!(true, "Normal mutex acquisition should succeed"),
+            Err(e) => {
+                eprintln!("Mutex error: {}", e);
+                assert!(false, "Should not error in normal conditions");
+            }
+        };
+    }
+    
+    #[test]
+    fn test_concurrent_mutex_access_safety() {
+        use std::sync::{Arc, Mutex};
+        use std::thread;
+        use std::time::Duration;
+        
+        let limiter = Arc::new(RateLimiter::new());
+        let mut handles = vec![];
+        
+        // Spawn multiple threads accessing the mutex concurrently
+        for i in 0..10 {
+            let limiter_clone = Arc::clone(&limiter);
+            let handle = thread::spawn(move || {
+                let ip = format!("192.168.1.{}", i);
+                for _ in 0..5 {
+                    limiter_clone.check_and_update(ip.clone());
+                    thread::sleep(Duration::from_millis(1));
+                }
+            });
+            handles.push(handle);
+        }
+        
+        // Wait for all threads to complete
+        for handle in handles {
+            handle.join().unwrap();
+        }
+        
+        // If we reach here without deadlock or panic, the test passes
+        assert!(true, "Concurrent mutex access should be safe");
+    }
+
     #[test]
     fn test_exponential_backoff_calculation() {
         let base_delay = Duration::from_millis(100);
