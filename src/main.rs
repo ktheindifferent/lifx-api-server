@@ -1,15 +1,18 @@
 extern crate lifx_api_server;
 use std::env;
+use log::{info, error};
 
 fn main() {
+    // Initialize logger with environment variable control
+    env_logger::init();
 
     if let Err(e) = sudo::with_env(&["SECRET_KEY"]) {
-        eprintln!("Failed to preserve SECRET_KEY environment variable: {}", e);
+        error!("Failed to preserve SECRET_KEY environment variable: {}", e);
         std::process::exit(1);
     }
     
     if let Err(e) = sudo::escalate_if_needed() {
-        eprintln!("Failed to escalate privileges: {}", e);
+        error!("Failed to escalate privileges: {}", e);
         std::process::exit(1);
     }
 
@@ -21,6 +24,7 @@ fn main() {
         port: 8000
     };
 
+    info!("Starting LIFX API server on port {}", config.port);
     lifx_api_server::start(config);
 
     // Now you can use curl to access the api
@@ -52,7 +56,7 @@ fn main() {
 
 
 
-    println!("sync");
+    info!("Server started, entering main loop");
 
     loop {
         
