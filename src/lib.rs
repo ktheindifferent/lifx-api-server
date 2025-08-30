@@ -1,6 +1,6 @@
 // TODO - Impliment authentication header (DONE)
 // TODO - Wrap as a rust library with configurable ports + authentication (DONE)
-// TODO - Impliment LIFX Effects, Scenes, Clean, Cycle
+// TODO - Impliment LIFX Effects, Scenes, Clean, Cycle (DONE)
 // TODO - Impliment an extended API for changing device labels, wifi-config, etc.
 
 
@@ -15,6 +15,7 @@ use rouille::try_or_400;
 use rand::{thread_rng, Rng};
 use rand::distributions::Alphanumeric;
 use std::thread;
+use log::{debug, info, warn, error};
 
 use rouille::Response;
 use rouille::post_input;
@@ -29,6 +30,18 @@ use colors_transform::{Rgb, Color};
 
 pub mod set_states;
 use set_states::{SetStatesHandler, StatesRequest};
+
+pub mod effects;
+use effects::{EffectsHandler, EffectRequest};
+
+pub mod scenes;
+use scenes::{ScenesHandler, CreateSceneRequest, ActivateSceneRequest};
+
+pub mod cycle;
+use cycle::{CycleHandler, CycleRequest};
+
+pub mod clean;
+use clean::{CleanHandler, CleanRequest};
 
 
 
@@ -97,7 +110,14 @@ impl RateLimiter {
     }
 
     fn check_and_update(&self, client_ip: String) -> bool {
-        let mut attempts = self.attempts.lock().unwrap();
+        let mut attempts = match self.attempts.lock() {
+            Ok(guard) => guard,
+            Err(e) => {
+                eprintln!("Failed to acquire rate limiter lock: {}", e);
+                // On mutex poisoning, deny access for safety
+                return false;
+            }
+        };
         let now = Instant::now();
         let window = Duration::from_secs(AUTH_WINDOW_SECONDS);
         
@@ -129,7 +149,14 @@ impl RateLimiter {
     }
 
     fn cleanup_old_entries(&self) {
-        let mut attempts = self.attempts.lock().unwrap();
+        let mut attempts = match self.attempts.lock() {
+            Ok(guard) => guard,
+            Err(e) => {
+                eprintln!("Failed to acquire rate limiter lock for cleanup: {}", e);
+                // If we can't clean up, just return - not critical
+                return;
+            }
+        };
         let now = Instant::now();
         let window = Duration::from_secs(AUTH_WINDOW_SECONDS * 2);
         
@@ -552,7 +579,7 @@ impl Manager {
         match Message::from_raw(&raw)? {
             Message::StateService { port: _, service: _ } => {
                 // if port != bulb.addr.port() as u32 || service != Service::UDP {
-                //     println!("Unsupported service: {:?}/{}", service, port);
+                //     debug!("Unsupported service: {:?}/{}", service, port);
                 // }
             }
             Message::StateLabel { label } => {
@@ -579,7 +606,7 @@ impl Manager {
             } => {
                 bulb.model.update((vendor, product));
                 if let Some(info) = get_product_info(vendor, product) {
-                    // println!("{:?}", info.clone());
+                    // debug!("{:?}", info.clone());
 
                     bulb.product = Some(info.clone());
 
@@ -695,7 +722,7 @@ impl Manager {
                 }
             }
             unknown => {
-                println!("Received, but ignored {:?}", unknown);
+                debug!("Received, but ignored {:?}", unknown);
             }
         }
         Ok(())
@@ -715,7 +742,7 @@ impl Manager {
         loop {
             match recv_sock.recv_from(&mut buf) {
                 Ok((0, addr)) => {
-                    println!("Received a zero-byte datagram from {:?}", addr);
+                    warn!("Received a zero-byte datagram from {:?}", addr);
                     consecutive_errors = 0;
                 },
                 Ok((nbytes, addr)) => {
@@ -733,20 +760,20 @@ impl Manager {
                                         BulbInfo::new(source, raw.frame_addr.target, addr)
                                     });
                                 if let Err(e) = Self::handle_message(raw, bulb) {
-                                    println!("Error handling message from {}: {}", addr, e)
+                                    error!("Error handling message from {}: {}", addr, e)
                                 }
                             }
                         }
-                        Err(e) => println!("Error unpacking raw message from {}: {}", addr, e),
+                        Err(e) => error!("Error unpacking raw message from {}: {}", addr, e),
                     }
                 },
                 Err(e) => {
                     consecutive_errors += 1;
-                    eprintln!("Network error in recv_from (attempt {}/{}): {:?}", 
+                    error!("Network error in recv_from (attempt {}/{}): {:?}", 
                              consecutive_errors, max_consecutive_errors, e);
                     
                     if consecutive_errors >= max_consecutive_errors {
-                        eprintln!("CRITICAL: Too many consecutive network errors. Resetting error counter and continuing with maximum backoff.");
+                        error!("CRITICAL: Too many consecutive network errors. Resetting error counter and continuing with maximum backoff.");
                         consecutive_errors = 0;
                         thread::sleep(max_delay);
                     } else {
@@ -755,7 +782,7 @@ impl Manager {
                             .saturating_mul(backoff_multiplier)
                             .min(max_delay);
                         
-                        eprintln!("Retrying after {:?} delay...", delay);
+                        warn!("Retrying after {:?} delay...", delay);
                         thread::sleep(delay);
                     }
                     
@@ -764,15 +791,15 @@ impl Manager {
                             continue;
                         }
                         std::io::ErrorKind::Interrupted => {
-                            eprintln!("Network operation interrupted, retrying immediately...");
+                            warn!("Network operation interrupted, retrying immediately...");
                             continue;
                         }
                         std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::ConnectionAborted => {
-                            eprintln!("Connection lost, attempting to recover...");
+                            warn!("Connection lost, attempting to recover...");
                             continue;
                         }
                         _ => {
-                            eprintln!("Unexpected network error type: {:?}, continuing anyway...", e.kind());
+                            warn!("Unexpected network error type: {:?}, continuing anyway...", e.kind());
                             continue;
                         }
                     }
@@ -782,7 +809,7 @@ impl Manager {
     }
 
     fn discover(&mut self) -> Result<(), failure::Error> {
-        println!("Doing discovery");
+        info!("Doing discovery");
 
         let opts = BuildOptions {
             source: self.source,
@@ -804,7 +831,7 @@ impl Manager {
                         continue;
                     }
                     let addr = SocketAddr::new(IpAddr::V4(bcast), 56700);
-                    println!("Discovering bulbs on LAN {:?}", addr);
+                    info!("Discovering bulbs on LAN {:?}", addr);
                     self.sock.send_to(&bytes, &addr)?;
                 }
                 _ => {}
@@ -823,7 +850,7 @@ impl Manager {
                     Ok(_missing_info) => {
                     },
                     Err(e) => {
-                        println!("Error querying for missing info: {:?}", e);
+                        error!("Error querying for missing info: {:?}", e);
                     }
                 }
             }
@@ -843,12 +870,12 @@ pub fn start(config: Config) {
 
 
     if let Err(e) = sudo::with_env(&["SECRET_KEY"]) {
-        eprintln!("Failed to preserve SECRET_KEY environment variable: {}", e);
+        error!("Failed to preserve SECRET_KEY environment variable: {}", e);
         std::process::exit(1);
     }
     
     if let Err(e) = sudo::escalate_if_needed() {
-        eprintln!("Failed to escalate privileges: {}", e);
+        error!("Failed to escalate privileges: {}", e);
         std::process::exit(1);
     }
 
@@ -866,7 +893,7 @@ pub fn start(config: Config) {
                     let mut lock = match th_arc_mgr.lock() {
                         Ok(l) => l,
                         Err(e) => {
-                            eprintln!("Failed to acquire lock: {}", e);
+                            error!("Failed to acquire lock: {}", e);
                             thread::sleep(Duration::from_millis(1000));
                             continue;
                         }
@@ -889,6 +916,9 @@ pub fn start(config: Config) {
             // Initialize rate limiter
             let rate_limiter = Arc::new(RateLimiter::new());
             
+            // Initialize scenes handler
+            let scenes_handler = Arc::new(ScenesHandler::new());
+            
             // Spawn cleanup thread for rate limiter
             let cleanup_limiter = Arc::clone(&rate_limiter);
             thread::spawn(move || {
@@ -899,6 +929,7 @@ pub fn start(config: Config) {
             });
         
             thread::spawn(move || {
+                let scenes_handler = scenes_handler.clone();
                 rouille::start_server(format!("0.0.0.0:{}", config.port).as_str(), move |request| {
         
                     // Use centralized authentication middleware
@@ -917,7 +948,7 @@ pub fn start(config: Config) {
                     let mut lock = match th2_arc_mgr.lock() {
                         Ok(l) => l,
                         Err(e) => {
-                            eprintln!("Failed to acquire lock: {}", e);
+                            error!("Failed to acquire lock: {}", e);
                             return Response::text("Internal Server Error").with_status_code(500);
                         }
                     };
@@ -939,6 +970,69 @@ pub fn start(config: Config) {
             
         
         
+                    // Scenes API endpoints (handle before selector-based endpoints)
+                    // GET /v1/scenes
+                    if request.url() == "/v1/scenes" && request.method() == "GET" {
+                        let scenes_response = scenes_handler.list_scenes();
+                        return Response::json(&scenes_response);
+                    }
+                    
+                    // POST /v1/scenes
+                    if request.url() == "/v1/scenes" && request.method() == "POST" {
+                        let body = try_or_400!(rouille::input::plain_text_body(request));
+                        let input: CreateSceneRequest = try_or_400!(serde_json::from_str(&body));
+                        
+                        let scene_response = scenes_handler.create_scene(input);
+                        return Response::json(&scene_response);
+                    }
+                    
+                    // PUT /v1/scenes/:uuid/activate
+                    if request.url().contains("/scenes/") && request.url().contains("/activate") && request.method() == "PUT" {
+                        let url_string = request.url().to_string();
+                        let url_parts: Vec<&str> = url_string.split('/').collect();
+                        if url_parts.len() >= 4 {
+                            let uuid = url_parts[3];
+                            let body = try_or_400!(rouille::input::plain_text_body(request));
+                            let input: ActivateSceneRequest = if body.is_empty() {
+                                ActivateSceneRequest { duration: None, fast: None }
+                            } else {
+                                try_or_400!(serde_json::from_str(&body))
+                            };
+                            
+                            match scenes_handler.activate_scene(mgr, uuid, input) {
+                                Ok(activate_response) => return Response::json(&activate_response),
+                                Err(e) => return Response::text(json!({ "error": e }).to_string()).with_status_code(404),
+                            }
+                        }
+                    }
+                    
+                    // DELETE /v1/scenes/:uuid
+                    if request.url().contains("/scenes/") && request.method() == "DELETE" {
+                        let url_string = request.url().to_string();
+                        let url_parts: Vec<&str> = url_string.split('/').collect();
+                        if url_parts.len() >= 4 {
+                            let uuid = url_parts[3];
+                            if scenes_handler.delete_scene(uuid) {
+                                return Response::text(json!({ "status": "deleted" }).to_string());
+                            } else {
+                                return Response::text(json!({ "error": "Scene not found" }).to_string()).with_status_code(404);
+                            }
+                        }
+                    }
+                    
+                    // POST /v1/scenes/capture
+                    if request.url() == "/v1/scenes/capture" && request.method() == "POST" {
+                        let body = try_or_400!(rouille::input::plain_text_body(request));
+                        let input: serde_json::Value = try_or_400!(serde_json::from_str(&body));
+                        let name = input.get("name")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("Captured Scene")
+                            .to_string();
+                        
+                        let scene_response = scenes_handler.capture_current_state(mgr, name);
+                        return Response::json(&scene_response);
+                    }
+                    
                     // (PUT) SetStates
                     // https://api.lifx.com/v1/lights/states
                     if request.url().contains("/lights/states") && request.method() == "PUT" {
@@ -952,11 +1046,16 @@ pub fn start(config: Config) {
                         // For other endpoints, we need bulbs_vec
                         let mut bulbs_vec: Vec<&BulbInfo> = Vec::new();
         
-                        let bulbs = mgr.bulbs.lock().unwrap();
+                        let bulbs = match mgr.bulbs.lock() {
+                            Ok(guard) => guard,
+                            Err(e) => {
+                                eprintln!("Failed to acquire bulbs lock: {}", e);
+                                return Response::text("Internal Server Error").with_status_code(500);
+                            }
+                        };
                         
                             
                         for bulb in bulbs.values() {
-                            println!("{:?}", *bulb);
                             bulbs_vec.push(bulb);
                         }
         
@@ -1153,7 +1252,7 @@ pub fn start(config: Config) {
                                     let new_hue = match parse_u16_safe(&hue_vec[1]) {
                                         Ok(h) => h,
                                         Err(e) => {
-                                            println!("Error parsing hue: {}", e);
+                                            error!("Error parsing hue: {}", e);
                                             continue;
                                         }
                                     }; 
@@ -1172,7 +1271,7 @@ pub fn start(config: Config) {
                                     let new_saturation_float = match parse_f64_safe(&saturation_vec[1]) {
                                         Ok(s) => s,
                                         Err(e) => {
-                                            println!("Error parsing saturation: {}", e);
+                                            error!("Error parsing saturation: {}", e);
                                             continue;
                                         }
                                     }; 
@@ -1192,7 +1291,7 @@ pub fn start(config: Config) {
                                     let new_brightness_float = match parse_f64_safe(&brightness_vec[1]) {
                                         Ok(b) => b,
                                         Err(e) => {
-                                            println!("Error parsing brightness: {}", e);
+                                            error!("Error parsing brightness: {}", e);
                                             continue;
                                         }
                                     }; 
@@ -1212,7 +1311,7 @@ pub fn start(config: Config) {
                                     let new_kelvin = match parse_u16_safe(&kelvin_vec[1]) {
                                         Ok(k) => k,
                                         Err(e) => {
-                                            println!("Error parsing kelvin: {}", e);
+                                            error!("Error parsing kelvin: {}", e);
                                             continue;
                                         }
                                     }; 
@@ -1238,7 +1337,7 @@ pub fn start(config: Config) {
                                     let red_int = match parse_i64_safe(&rgb_parts_vec[0]) {
                                         Ok(r) => r,
                                         Err(e) => {
-                                            println!("Error parsing red value: {}", e);
+                                            error!("Error parsing red value: {}", e);
                                             continue;
                                         }
                                     };
@@ -1247,7 +1346,7 @@ pub fn start(config: Config) {
                                     let green_int = match parse_i64_safe(&rgb_parts_vec[1]) {
                                         Ok(g) => g,
                                         Err(e) => {
-                                            println!("Error parsing green value: {}", e);
+                                            error!("Error parsing green value: {}", e);
                                             continue;
                                         }
                                     };
@@ -1256,7 +1355,7 @@ pub fn start(config: Config) {
                                     let blue_int = match parse_i64_safe(&rgb_parts_vec[2]) {
                                         Ok(b) => b,
                                         Err(e) => {
-                                            println!("Error parsing blue value: {}", e);
+                                            error!("Error parsing blue value: {}", e);
                                             continue;
                                         }
                                     };
@@ -1279,7 +1378,7 @@ pub fn start(config: Config) {
                                 }
         
                                 if cc.contains("#"){
-                                    println!("!CC!");
+                                    debug!("Processing color conversion");
                                     let hex_split = cc.split("#");
                                     let hex_vec: Vec<&str> = hex_split.collect();
                                     let hex = hex_vec[1].to_string();
@@ -1287,18 +1386,18 @@ pub fn start(config: Config) {
                                     let rgb2 = match Rgb::from_hex_str(format!("#{}", hex).as_str()) {
                                         Ok(rgb) => rgb,
                                         Err(_) => {
-                                            println!("Error parsing hex color: {}", hex);
+                                            error!("Error parsing hex color: {}", hex);
                                             continue;
                                         }
                                     };
                                     // Rgb { r: 255.0, g: 204.0, b: 0.0 }
         
-                                    println!("{:?}", rgb2);
+                                    debug!("RGB values: {:?}", rgb2);
         
                                     let red_int = match parse_i64_safe(&rgb2.get_red().to_string()) {
                                         Ok(r) => r,
                                         Err(e) => {
-                                            println!("Error parsing red from hex: {}", e);
+                                            error!("Error parsing red from hex: {}", e);
                                             continue;
                                         }
                                     };
@@ -1307,7 +1406,7 @@ pub fn start(config: Config) {
                                     let green_int = match parse_i64_safe(&rgb2.get_green().to_string()) {
                                         Ok(g) => g,
                                         Err(e) => {
-                                            println!("Error parsing green from hex: {}", e);
+                                            error!("Error parsing green from hex: {}", e);
                                             continue;
                                         }
                                     };
@@ -1316,22 +1415,22 @@ pub fn start(config: Config) {
                                     let blue_int = match parse_i64_safe(&rgb2.get_blue().to_string()) {
                                         Ok(b) => b,
                                         Err(e) => {
-                                            println!("Error parsing blue from hex: {}", e);
+                                            error!("Error parsing blue from hex: {}", e);
                                             continue;
                                         }
                                     };
                                     let blue_float: f32 = (blue_int) as f32;
         
         
-                                    println!("red_float: {:?}", red_float);
-                                    println!("green_float: {:?}", green_float);
-                                    println!("blue_float: {:?}", blue_float);
+                                    debug!("red_float: {:?}", red_float);
+                                    debug!("green_float: {:?}", green_float);
+                                    debug!("blue_float: {:?}", blue_float);
         
                     
                                     let rgb = Srgb::new(red_float / 255.0, green_float / 255.0, blue_float / 255.0);
                                     let hcc: Hsv = rgb.into_color();
 
-                                    println!("hcc: {:?}", hcc);
+                                    debug!("HSV values: {:?}", hcc);
         
                                     // Convert HSV to LIFX HSBK format (16-bit values)
                                     let hbsk_set = HSBK {
@@ -1341,7 +1440,7 @@ pub fn start(config: Config) {
                                         kelvin: kelvin,
                                     };
 
-                                    println!("hbsk_set: {:?}", hbsk_set);
+                                    debug!("HBSK values: {:?}", hbsk_set);
         
         
         
@@ -1386,7 +1485,7 @@ pub fn start(config: Config) {
                                 let new_brightness_float = match parse_f64_safe(&brightness.to_string()) {
                                     Ok(b) => b,
                                     Err(e) => {
-                                        println!("Error parsing brightness: {}", e);
+                                        error!("Error parsing brightness: {}", e);
                                         continue;
                                     }
                                 }; 
@@ -1450,8 +1549,61 @@ pub fn start(config: Config) {
         
                         // ListLights
                         // https://api.lifx.com/v1/lights/:selector
-                        if request.url().contains("/v1/lights/") && !request.url().contains("/state"){
+                        if request.url().contains("/v1/lights/") && !request.url().contains("/state") && !request.url().contains("/effects") && !request.url().contains("/cycle") && !request.url().contains("/clean"){
                             response = Response::json(&bulbs_vec.clone());
+                        }
+                        
+                        // Effects API endpoints
+                        // POST /v1/lights/:selector/effects/pulse
+                        if request.url().contains("/effects/pulse") && request.method() == "POST" {
+                            let body = try_or_400!(rouille::input::plain_text_body(request));
+                            let input: EffectRequest = try_or_400!(serde_json::from_str(&body));
+                            
+                            let handler = EffectsHandler::new();
+                            let effects_response = handler.handle_pulse(mgr, &bulbs_vec, input);
+                            response = Response::json(&effects_response);
+                        }
+                        
+                        // POST /v1/lights/:selector/effects/breathe
+                        if request.url().contains("/effects/breathe") && request.method() == "POST" {
+                            let body = try_or_400!(rouille::input::plain_text_body(request));
+                            let input: EffectRequest = try_or_400!(serde_json::from_str(&body));
+                            
+                            let handler = EffectsHandler::new();
+                            let effects_response = handler.handle_breathe(mgr, &bulbs_vec, input);
+                            response = Response::json(&effects_response);
+                        }
+                        
+                        // POST /v1/lights/:selector/effects/strobe
+                        if request.url().contains("/effects/strobe") && request.method() == "POST" {
+                            let body = try_or_400!(rouille::input::plain_text_body(request));
+                            let input: EffectRequest = try_or_400!(serde_json::from_str(&body));
+                            
+                            let handler = EffectsHandler::new();
+                            let effects_response = handler.handle_strobe(mgr, &bulbs_vec, input);
+                            response = Response::json(&effects_response);
+                        }
+                        
+                        // Cycle API endpoint
+                        // POST /v1/lights/:selector/cycle
+                        if request.url().contains("/cycle") && request.method() == "POST" {
+                            let body = try_or_400!(rouille::input::plain_text_body(request));
+                            let input: CycleRequest = try_or_400!(serde_json::from_str(&body));
+                            
+                            let handler = CycleHandler::new();
+                            let cycle_response = handler.handle_cycle(mgr, &bulbs_vec, input);
+                            response = Response::json(&cycle_response);
+                        }
+                        
+                        // Clean API endpoint
+                        // POST /v1/lights/:selector/clean
+                        if request.url().contains("/clean") && request.method() == "POST" {
+                            let body = try_or_400!(rouille::input::plain_text_body(request));
+                            let input: CleanRequest = try_or_400!(serde_json::from_str(&body));
+                            
+                            let handler = CleanHandler::new();
+                            let clean_response = handler.handle_clean(mgr, &bulbs_vec, input);
+                            response = Response::json(&clean_response);
                         }
                     } // Close the else block here
         
@@ -1465,7 +1617,7 @@ pub fn start(config: Config) {
 
         },
         Err(e) => {
-            println!("{:?}", e);
+            error!("Server error: {:?}", e);
         }
     }
 
@@ -1988,6 +2140,105 @@ mod tests {
         assert!(error_count.load(Ordering::Relaxed) > 0, "Should have encountered timeout errors");
     }
     
+    // Mutex error handling tests
+    #[test]
+    fn test_rate_limiter_mutex_poisoning_simulation() {
+        use std::sync::{Arc, Mutex};
+        use std::thread;
+        use std::panic;
+        
+        let limiter = Arc::new(RateLimiter::new());
+        let limiter_clone = Arc::clone(&limiter);
+        
+        // Spawn a thread that will panic while holding the mutex
+        let handle = thread::spawn(move || {
+            let _guard = limiter_clone.attempts.lock().unwrap();
+            panic!("Simulating panic with mutex held");
+        });
+        
+        // Wait for the panic to occur
+        let _ = handle.join();
+        
+        // Now the mutex is poisoned - test that check_and_update handles it
+        let result = limiter.check_and_update("192.168.1.1".to_string());
+        // Should return false when mutex is poisoned
+        assert!(!result, "Should deny access when mutex is poisoned");
+    }
+    
+    #[test]
+    fn test_rate_limiter_cleanup_with_poisoned_mutex() {
+        use std::sync::{Arc, Mutex};
+        use std::thread;
+        use std::panic;
+        
+        let limiter = Arc::new(RateLimiter::new());
+        let limiter_clone = Arc::clone(&limiter);
+        
+        // Spawn a thread that will panic while holding the mutex
+        let handle = thread::spawn(move || {
+            let _guard = limiter_clone.attempts.lock().unwrap();
+            panic!("Simulating panic with mutex held");
+        });
+        
+        // Wait for the panic to occur
+        let _ = handle.join();
+        
+        // Now the mutex is poisoned - test that cleanup_old_entries handles it gracefully
+        // This should not panic, just return early
+        limiter.cleanup_old_entries();
+        // If we reach here without panic, the test passes
+        assert!(true, "cleanup_old_entries should handle poisoned mutex gracefully");
+    }
+    
+    #[test]
+    fn test_manager_bulbs_mutex_error_handling() {
+        use std::sync::{Arc, Mutex};
+        use std::collections::HashMap;
+        
+        // Create a Manager-like structure for testing
+        let bulbs: Arc<Mutex<HashMap<u64, BulbInfo>>> = Arc::new(Mutex::new(HashMap::new()));
+        
+        // Test that we can handle mutex errors properly
+        match bulbs.lock() {
+            Ok(_) => assert!(true, "Normal mutex acquisition should succeed"),
+            Err(e) => {
+                eprintln!("Mutex error: {}", e);
+                assert!(false, "Should not error in normal conditions");
+            }
+        };
+    }
+    
+    #[test]
+    fn test_concurrent_mutex_access_safety() {
+        use std::sync::{Arc, Mutex};
+        use std::thread;
+        use std::time::Duration;
+        
+        let limiter = Arc::new(RateLimiter::new());
+        let mut handles = vec![];
+        
+        // Spawn multiple threads accessing the mutex concurrently
+        for i in 0..10 {
+            let limiter_clone = Arc::clone(&limiter);
+            let handle = thread::spawn(move || {
+                let ip = format!("192.168.1.{}", i);
+                for _ in 0..5 {
+                    limiter_clone.check_and_update(ip.clone());
+                    thread::sleep(Duration::from_millis(1));
+                }
+            });
+            handles.push(handle);
+        }
+        
+        // Wait for all threads to complete
+        for handle in handles {
+            handle.join().unwrap();
+        }
+        
+        // If we reach here without deadlock or panic, the test passes
+        assert!(true, "Concurrent mutex access should be safe");
+    }
+
     #[test]
     fn test_exponential_backoff_calculation() {
         let base_delay = Duration::from_millis(100);

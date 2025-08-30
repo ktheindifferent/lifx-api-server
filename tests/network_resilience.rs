@@ -30,7 +30,8 @@ fn test_service_resilience_under_network_failures() {
         };
         
         // Set a short timeout to simulate network timeouts
-        socket.set_read_timeout(Some(Duration::from_millis(50))).unwrap();
+        socket.set_read_timeout(Some(Duration::from_millis(50)))
+            .expect("Failed to set socket read timeout");
         
         let mut buf = [0; 1024];
         let mut consecutive_errors: u32 = 0;
@@ -100,7 +101,8 @@ fn test_service_resilience_under_network_failures() {
     
     // Stop the worker gracefully
     should_stop.store(true, Ordering::Relaxed);
-    worker_handle.join().unwrap();
+    worker_handle.join()
+        .expect("Failed to join worker thread");
     
     println!("Test completed successfully:");
     println!("  Errors encountered: {}", errors_encountered.load(Ordering::Relaxed));
@@ -112,8 +114,10 @@ fn test_recovery_after_network_restoration() {
     // This test simulates network failures followed by recovery
     
     let server = UdpSocket::bind("127.0.0.1:0").expect("Failed to bind server");
-    let server_addr = server.local_addr().unwrap();
-    server.set_read_timeout(Some(Duration::from_millis(100))).unwrap();
+    let server_addr = server.local_addr()
+        .expect("Failed to get server local address");
+    server.set_read_timeout(Some(Duration::from_millis(100)))
+        .expect("Failed to set server read timeout");
     
     let packets_received = Arc::new(AtomicUsize::new(0));
     let errors_encountered = Arc::new(AtomicUsize::new(0));
@@ -151,7 +155,8 @@ fn test_recovery_after_network_restoration() {
     
     // Phase 1: Send some packets (network working)
     for i in 0..3 {
-        client.send_to(format!("packet{}", i).as_bytes(), server_addr).unwrap();
+        client.send_to(format!("packet{}", i).as_bytes(), server_addr)
+            .expect(&format!("Failed to send packet {} to server", i));
         thread::sleep(Duration::from_millis(50));
     }
     
@@ -160,11 +165,13 @@ fn test_recovery_after_network_restoration() {
     
     // Phase 3: Network restored, send more packets
     for i in 3..6 {
-        client.send_to(format!("packet{}", i).as_bytes(), server_addr).unwrap();
+        client.send_to(format!("packet{}", i).as_bytes(), server_addr)
+            .expect(&format!("Failed to send packet {} to server", i));
         thread::sleep(Duration::from_millis(50));
     }
     
-    worker_handle.join().unwrap();
+    worker_handle.join()
+        .expect("Failed to join worker thread for recovery test");
     
     // Verify recovery: should have received packets before and after the outage
     assert!(packets_received.load(Ordering::Relaxed) >= 4, 

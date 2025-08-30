@@ -18,7 +18,8 @@ fn test_valid_state_request() {
         ]
     }"#;
     
-    let request: StatesRequest = serde_json::from_str(json).unwrap();
+    let request: StatesRequest = serde_json::from_str(json)
+        .expect("Failed to parse valid StatesRequest JSON");
     assert_eq!(request.states.len(), 2);
     assert_eq!(request.states[0].selector, "all");
     assert_eq!(request.states[0].power, Some("on".to_string()));
@@ -45,11 +46,13 @@ fn test_state_request_with_defaults() {
         }
     }"#;
     
-    let request: StatesRequest = serde_json::from_str(json).unwrap();
+    let request: StatesRequest = serde_json::from_str(json)
+        .expect("Failed to parse StatesRequest JSON with defaults");
     assert_eq!(request.states.len(), 2);
     assert!(request.defaults.is_some());
     
-    let defaults = request.defaults.unwrap();
+    let defaults = request.defaults
+        .expect("Expected defaults to be present in request");
     assert_eq!(defaults.power, Some("on".to_string()));
     assert_eq!(defaults.brightness, Some(0.5));
     assert_eq!(defaults.duration, Some(1.0));
@@ -91,7 +94,8 @@ fn test_color_formats() {
     ];
     
     for (json_str, expected) in test_cases {
-        let state: StateUpdate = serde_json::from_str(json_str).unwrap();
+        let state: StateUpdate = serde_json::from_str(json_str)
+            .expect(&format!("Failed to parse StateUpdate JSON for color format test: {}", json_str));
         assert_eq!(state.color, expected);
     }
 }
@@ -109,7 +113,8 @@ fn test_selector_formats() {
     ];
     
     for json_str in test_cases {
-        let state: StateUpdate = serde_json::from_str(json_str).unwrap();
+        let state: StateUpdate = serde_json::from_str(json_str)
+            .expect(&format!("Failed to parse StateUpdate JSON for color format test: {}", json_str));
         assert!(!state.selector.is_empty());
     }
 }
@@ -122,7 +127,8 @@ fn test_brightness_and_infrared_ranges() {
         "infrared": 0.3
     }"#;
     
-    let state: StateUpdate = serde_json::from_str(valid_json).unwrap();
+    let state: StateUpdate = serde_json::from_str(valid_json)
+        .expect("Failed to parse StateUpdate JSON with brightness and infrared");
     assert_eq!(state.brightness, Some(0.5));
     assert_eq!(state.infrared, Some(0.3));
 }
@@ -135,7 +141,8 @@ fn test_duration_field() {
         "duration": 5.5
     }"#;
     
-    let state: StateUpdate = serde_json::from_str(json).unwrap();
+    let state: StateUpdate = serde_json::from_str(json)
+        .expect("Failed to parse StateUpdate JSON with duration field");
     assert_eq!(state.duration, Some(5.5));
 }
 
@@ -147,7 +154,8 @@ fn test_fast_field() {
         "fast": true
     }"#;
     
-    let state: StateUpdate = serde_json::from_str(json).unwrap();
+    let state: StateUpdate = serde_json::from_str(json)
+        .expect("Failed to parse StateUpdate JSON with fast field");
     assert_eq!(state.fast, Some(true));
 }
 
@@ -157,7 +165,8 @@ fn test_empty_states_array() {
         "states": []
     }"#;
     
-    let request: StatesRequest = serde_json::from_str(json).unwrap();
+    let request: StatesRequest = serde_json::from_str(json)
+        .expect("Failed to parse StatesRequest JSON with empty states array");
     assert_eq!(request.states.len(), 0);
 }
 
@@ -188,7 +197,8 @@ fn test_multiple_state_updates() {
         ]
     }"#;
     
-    let request: StatesRequest = serde_json::from_str(json).unwrap();
+    let request: StatesRequest = serde_json::from_str(json)
+        .expect("Failed to parse StatesRequest JSON with multiple state updates");
     assert_eq!(request.states.len(), 4);
     
     // Verify each state
