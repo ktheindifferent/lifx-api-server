@@ -60,7 +60,8 @@ mod tests {
         let request = create_test_request(states, None);
         
         // Brightness > 1.0 should fail validation
-        assert!(request.states[0].brightness.unwrap() > 1.0);
+        assert!(request.states[0].brightness
+            .expect("Brightness should be present in test state") > 1.0);
     }
     
     #[test]
@@ -80,7 +81,8 @@ mod tests {
         let request = create_test_request(states, None);
         
         // Negative infrared should fail validation
-        assert!(request.states[0].infrared.unwrap() < 0.0);
+        assert!(request.states[0].infrared
+            .expect("Infrared should be present in test state") < 0.0);
     }
     
     #[test]
@@ -289,7 +291,9 @@ mod tests {
         assert_eq!(request.states[0].fast, Some(false));
         
         assert_eq!(request.states[1].power, Some("on".to_string()));
-        assert!(request.states[1].color.as_ref().unwrap().contains("hue:200"));
+        assert!(request.states[1].color.as_ref()
+            .expect("Color should be present in state[1]")
+            .contains("hue:200"));
         assert_eq!(request.states[1].infrared, Some(0.2));
         assert_eq!(request.states[1].fast, Some(true));
     }
