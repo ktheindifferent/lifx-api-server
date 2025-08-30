@@ -65,7 +65,20 @@ impl SetStatesHandler {
     }
 
     pub fn handle_request(&self, mgr: &mut Manager, request: StatesRequest) -> StatesResponse {
-        let bulbs = mgr.bulbs.lock().unwrap();
+        let bulbs = match mgr.bulbs.lock() {
+            Ok(guard) => guard,
+            Err(e) => {
+                eprintln!("Failed to acquire bulbs lock in SetStatesHandler: {}", e);
+                return StatesResponse {
+                    results: vec![StateResult {
+                        id: "mutex_error".to_string(),
+                        label: "Internal Error".to_string(),
+                        status: "error".to_string(),
+                        error: Some("Failed to acquire bulbs lock".to_string()),
+                    }],
+                };
+            }
+        };
         
         // Validate request first
         if let Err(e) = self.validate_request(&request) {
