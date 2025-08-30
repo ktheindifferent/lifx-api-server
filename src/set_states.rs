@@ -1,11 +1,13 @@
 use std::collections::HashMap;
 use std::time::Duration;
 use std::thread;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
+use serde::de::{self, Visitor, MapAccess};
+use std::fmt;
 use lifx_rs::lan::{PowerLevel, HSBK};
 use crate::{BulbInfo, Manager};
 
-#[derive(Deserialize, Debug, Clone)]
+#[derive(Debug, Clone)]
 pub struct StateUpdate {
     pub selector: String,
     pub power: Option<String>,
@@ -14,6 +16,136 @@ pub struct StateUpdate {
     pub duration: Option<f64>,
     pub infrared: Option<f64>,
     pub fast: Option<bool>,
+}
+
+// Custom deserializer for StateUpdate with validation
+impl<'de> Deserialize<'de> for StateUpdate {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(field_identifier, rename_all = "lowercase")]
+        enum Field {
+            Selector,
+            Power,
+            Color,
+            Brightness,
+            Duration,
+            Infrared,
+            Fast,
+        }
+
+        struct StateUpdateVisitor;
+
+        impl<'de> Visitor<'de> for StateUpdateVisitor {
+            type Value = StateUpdate;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+                formatter.write_str("struct StateUpdate")
+            }
+
+            fn visit_map<V>(self, mut map: V) -> Result<StateUpdate, V::Error>
+            where
+                V: MapAccess<'de>,
+            {
+                let mut selector = None;
+                let mut power = None;
+                let mut color = None;
+                let mut brightness = None;
+                let mut duration = None;
+                let mut infrared = None;
+                let mut fast = None;
+
+                while let Some(key) = map.next_key()? {
+                    match key {
+                        Field::Selector => {
+                            if selector.is_some() {
+                                return Err(de::Error::duplicate_field("selector"));
+                            }
+                            selector = Some(map.next_value()?);
+                        }
+                        Field::Power => {
+                            if power.is_some() {
+                                return Err(de::Error::duplicate_field("power"));
+                            }
+                            let value: String = map.next_value()?;
+                            if value != "on" && value != "off" {
+                                return Err(de::Error::custom(format!("power must be 'on' or 'off', got '{}'", value)));
+                            }
+                            power = Some(Some(value));
+                        }
+                        Field::Color => {
+                            if color.is_some() {
+                                return Err(de::Error::duplicate_field("color"));
+                            }
+                            color = Some(map.next_value()?);
+                        }
+                        Field::Brightness => {
+                            if brightness.is_some() {
+                                return Err(de::Error::duplicate_field("brightness"));
+                            }
+                            let value: f64 = map.next_value()?;
+                            if !value.is_finite() {
+                                return Err(de::Error::custom(format!("brightness must be a finite number, got {}", value)));
+                            }
+                            if value < 0.0 || value > 1.0 {
+                                return Err(de::Error::custom(format!("brightness must be between 0.0 and 1.0, got {}", value)));
+                            }
+                            brightness = Some(Some(value));
+                        }
+                        Field::Duration => {
+                            if duration.is_some() {
+                                return Err(de::Error::duplicate_field("duration"));
+                            }
+                            let value: f64 = map.next_value()?;
+                            if !value.is_finite() {
+                                return Err(de::Error::custom(format!("duration must be a finite number, got {}", value)));
+                            }
+                            if value < 0.0 || value > 3155760000.0 {
+                                return Err(de::Error::custom("duration must be between 0 and 3155760000 seconds"));
+                            }
+                            duration = Some(Some(value));
+                        }
+                        Field::Infrared => {
+                            if infrared.is_some() {
+                                return Err(de::Error::duplicate_field("infrared"));
+                            }
+                            let value: f64 = map.next_value()?;
+                            if !value.is_finite() {
+                                return Err(de::Error::custom(format!("infrared must be a finite number, got {}", value)));
+                            }
+                            if value < 0.0 || value > 1.0 {
+                                return Err(de::Error::custom(format!("infrared must be between 0.0 and 1.0, got {}", value)));
+                            }
+                            infrared = Some(Some(value));
+                        }
+                        Field::Fast => {
+                            if fast.is_some() {
+                                return Err(de::Error::duplicate_field("fast"));
+                            }
+                            fast = Some(map.next_value()?);
+                        }
+                    }
+                }
+
+                let selector = selector.ok_or_else(|| de::Error::missing_field("selector"))?;
+                
+                Ok(StateUpdate {
+                    selector,
+                    power: power.unwrap_or(None),
+                    color: color.unwrap_or(None),
+                    brightness: brightness.unwrap_or(None),
+                    duration: duration.unwrap_or(None),
+                    infrared: infrared.unwrap_or(None),
+                    fast: fast.unwrap_or(None),
+                })
+            }
+        }
+
+        const FIELDS: &'static [&'static str] = &["selector", "power", "color", "brightness", "duration", "infrared", "fast"];
+        deserializer.deserialize_struct("StateUpdate", FIELDS, StateUpdateVisitor)
+    }
 }
 
 #[derive(Deserialize, Debug)]
@@ -159,6 +291,9 @@ impl SetStatesHandler {
             
             // Validate brightness range
             if let Some(brightness) = state.brightness {
+                if !brightness.is_finite() {
+                    return Err(format!("State[{}]: brightness must be a finite number, got {}", i, brightness));
+                }
                 if brightness < 0.0 || brightness > 1.0 {
                     return Err(format!("State[{}]: brightness must be between 0.0 and 1.0, got {}", i, brightness));
                 }
@@ -166,6 +301,9 @@ impl SetStatesHandler {
             
             // Validate infrared range
             if let Some(infrared) = state.infrared {
+                if !infrared.is_finite() {
+                    return Err(format!("State[{}]: infrared must be a finite number, got {}", i, infrared));
+                }
                 if infrared < 0.0 || infrared > 1.0 {
                     return Err(format!("State[{}]: infrared must be between 0.0 and 1.0, got {}", i, infrared));
                 }
@@ -173,6 +311,9 @@ impl SetStatesHandler {
             
             // Validate duration
             if let Some(duration) = state.duration {
+                if !duration.is_finite() {
+                    return Err(format!("State[{}]: duration must be a finite number, got {}", i, duration));
+                }
                 if duration < 0.0 || duration > 3155760000.0 {
                     return Err(format!("State[{}]: duration must be between 0 and 3155760000 seconds", i));
                 }
@@ -195,14 +336,29 @@ impl SetStatesHandler {
             }
             
             if let Some(brightness) = defaults.brightness {
+                if !brightness.is_finite() {
+                    return Err(format!("Defaults: brightness must be a finite number, got {}", brightness));
+                }
                 if brightness < 0.0 || brightness > 1.0 {
-                    return Err(format!("Defaults: brightness must be between 0.0 and 1.0"));
+                    return Err(format!("Defaults: brightness must be between 0.0 and 1.0, got {}", brightness));
                 }
             }
             
             if let Some(infrared) = defaults.infrared {
+                if !infrared.is_finite() {
+                    return Err(format!("Defaults: infrared must be a finite number, got {}", infrared));
+                }
                 if infrared < 0.0 || infrared > 1.0 {
-                    return Err(format!("Defaults: infrared must be between 0.0 and 1.0"));
+                    return Err(format!("Defaults: infrared must be between 0.0 and 1.0, got {}", infrared));
+                }
+            }
+            
+            if let Some(duration) = defaults.duration {
+                if !duration.is_finite() {
+                    return Err(format!("Defaults: duration must be a finite number, got {}", duration));
+                }
+                if duration < 0.0 || duration > 3155760000.0 {
+                    return Err(format!("Defaults: duration must be between 0 and 3155760000 seconds, got {}", duration));
                 }
             }
             
@@ -233,18 +389,100 @@ impl SetStatesHandler {
             return true;
         }
         
-        // Prefixed values
-        if color.starts_with("kelvin:") || 
-           color.starts_with("hue:") ||
-           color.starts_with("saturation:") ||
-           color.starts_with("brightness:") ||
-           color.starts_with("rgb:") ||
-           color.starts_with("#") {
+        // Validate kelvin value
+        if let Some(kelvin_str) = color.strip_prefix("kelvin:") {
+            if let Ok(kelvin) = kelvin_str.parse::<u16>() {
+                return kelvin >= 1500 && kelvin <= 9000;
+            }
+            return false;
+        }
+        
+        // Validate hue value
+        if let Some(hue_str) = color.strip_prefix("hue:") {
+            if let Ok(hue) = hue_str.parse::<f64>() {
+                return hue.is_finite() && hue >= 0.0 && hue <= 360.0;
+            }
+            return false;
+        }
+        
+        // Validate saturation value
+        if let Some(sat_str) = color.strip_prefix("saturation:") {
+            if let Ok(sat) = sat_str.parse::<f64>() {
+                return sat.is_finite() && sat >= 0.0 && sat <= 1.0;
+            }
+            return false;
+        }
+        
+        // Validate brightness value
+        if let Some(bright_str) = color.strip_prefix("brightness:") {
+            if let Ok(bright) = bright_str.parse::<f64>() {
+                return bright.is_finite() && bright >= 0.0 && bright <= 1.0;
+            }
+            return false;
+        }
+        
+        // Validate RGB format
+        if let Some(rgb_str) = color.strip_prefix("rgb:") {
+            let parts: Vec<&str> = rgb_str.split(',').collect();
+            if parts.len() != 3 {
+                return false;
+            }
+            for part in parts {
+                if part.trim().parse::<u8>().is_err() {
+                    return false;
+                }
+            }
             return true;
         }
         
+        // Validate hex color
+        if let Some(hex) = color.strip_prefix("#") {
+            if hex.len() != 6 {
+                return false;
+            }
+            return hex.chars().all(|c| c.is_ascii_hexdigit());
+        }
+        
         // HSB format: "hue:120 saturation:1.0 brightness:0.5"
-        if color.contains("hue:") || color.contains("saturation:") || color.contains("brightness:") {
+        if color.contains(" ") && (color.contains("hue:") || color.contains("saturation:") || color.contains("brightness:") || color.contains("kelvin:")) {
+            let parts: Vec<&str> = color.split_whitespace().collect();
+            for part in parts {
+                if let Some(hue_str) = part.strip_prefix("hue:") {
+                    if let Ok(hue) = hue_str.parse::<f64>() {
+                        if !hue.is_finite() || hue < 0.0 || hue > 360.0 {
+                            return false;
+                        }
+                    } else {
+                        return false;
+                    }
+                } else if let Some(sat_str) = part.strip_prefix("saturation:") {
+                    if let Ok(sat) = sat_str.parse::<f64>() {
+                        if !sat.is_finite() || sat < 0.0 || sat > 1.0 {
+                            return false;
+                        }
+                    } else {
+                        return false;
+                    }
+                } else if let Some(bright_str) = part.strip_prefix("brightness:") {
+                    if let Ok(bright) = bright_str.parse::<f64>() {
+                        if !bright.is_finite() || bright < 0.0 || bright > 1.0 {
+                            return false;
+                        }
+                    } else {
+                        return false;
+                    }
+                } else if let Some(kelvin_str) = part.strip_prefix("kelvin:") {
+                    if let Ok(kelvin) = kelvin_str.parse::<u16>() {
+                        if kelvin < 1500 || kelvin > 9000 {
+                            return false;
+                        }
+                    } else {
+                        return false;
+                    }
+                } else {
+                    return false;
+                }
+            }
             return true;
         }
         

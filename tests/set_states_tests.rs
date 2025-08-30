@@ -69,14 +69,14 @@ fn test_invalid_power_value() {
         ]
     }"#;
     
-    let request: StatesRequest = serde_json::from_str(json)
-        .expect("Failed to parse StatesRequest JSON with invalid power value");
-    let _handler = SetStatesHandler::new();
+    // With the custom deserializer, invalid power values should be rejected at deserialization time
+    let result: Result<StatesRequest, _> = serde_json::from_str(json);
+    assert!(result.is_err(), "Should reject invalid power value at deserialization");
     
-    // This should fail validation
-    // Note: We can't test the actual validation without a Manager instance
-    // This test just verifies the JSON parsing works
-    assert_eq!(request.states[0].power, Some("invalid".to_string()));
+    // The error message should mention the invalid power value
+    let error_msg = result.unwrap_err().to_string();
+    assert!(error_msg.contains("power") && error_msg.contains("'on' or 'off'"), 
+            "Error message should mention power validation: {}", error_msg);
 }
 
 #[test]
