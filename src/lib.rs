@@ -1,6 +1,6 @@
 // TODO - Impliment authentication header (DONE)
 // TODO - Wrap as a rust library with configurable ports + authentication (DONE)
-// TODO - Impliment LIFX Effects, Scenes, Clean, Cycle
+// TODO - Impliment LIFX Effects, Scenes, Clean, Cycle (DONE)
 // TODO - Impliment an extended API for changing device labels, wifi-config, etc.
 
 
@@ -30,6 +30,18 @@ use colors_transform::{Rgb, Color};
 
 pub mod set_states;
 use set_states::{SetStatesHandler, StatesRequest};
+
+pub mod effects;
+use effects::{EffectsHandler, EffectRequest};
+
+pub mod scenes;
+use scenes::{ScenesHandler, CreateSceneRequest, ActivateSceneRequest};
+
+pub mod cycle;
+use cycle::{CycleHandler, CycleRequest};
+
+pub mod clean;
+use clean::{CleanHandler, CleanRequest};
 
 
 
@@ -904,6 +916,9 @@ pub fn start(config: Config) {
             // Initialize rate limiter
             let rate_limiter = Arc::new(RateLimiter::new());
             
+            // Initialize scenes handler
+            let scenes_handler = Arc::new(ScenesHandler::new());
+            
             // Spawn cleanup thread for rate limiter
             let cleanup_limiter = Arc::clone(&rate_limiter);
             thread::spawn(move || {
@@ -914,6 +929,7 @@ pub fn start(config: Config) {
             });
         
             thread::spawn(move || {
+                let scenes_handler = scenes_handler.clone();
                 rouille::start_server(format!("0.0.0.0:{}", config.port).as_str(), move |request| {
         
                     // Use centralized authentication middleware
@@ -954,6 +970,69 @@ pub fn start(config: Config) {
             
         
         
+                    // Scenes API endpoints (handle before selector-based endpoints)
+                    // GET /v1/scenes
+                    if request.url() == "/v1/scenes" && request.method() == "GET" {
+                        let scenes_response = scenes_handler.list_scenes();
+                        return Response::json(&scenes_response);
+                    }
+                    
+                    // POST /v1/scenes
+                    if request.url() == "/v1/scenes" && request.method() == "POST" {
+                        let body = try_or_400!(rouille::input::plain_text_body(request));
+                        let input: CreateSceneRequest = try_or_400!(serde_json::from_str(&body));
+                        
+                        let scene_response = scenes_handler.create_scene(input);
+                        return Response::json(&scene_response);
+                    }
+                    
+                    // PUT /v1/scenes/:uuid/activate
+                    if request.url().contains("/scenes/") && request.url().contains("/activate") && request.method() == "PUT" {
+                        let url_string = request.url().to_string();
+                        let url_parts: Vec<&str> = url_string.split('/').collect();
+                        if url_parts.len() >= 4 {
+                            let uuid = url_parts[3];
+                            let body = try_or_400!(rouille::input::plain_text_body(request));
+                            let input: ActivateSceneRequest = if body.is_empty() {
+                                ActivateSceneRequest { duration: None, fast: None }
+                            } else {
+                                try_or_400!(serde_json::from_str(&body))
+                            };
+                            
+                            match scenes_handler.activate_scene(mgr, uuid, input) {
+                                Ok(activate_response) => return Response::json(&activate_response),
+                                Err(e) => return Response::text(json!({ "error": e }).to_string()).with_status_code(404),
+                            }
+                        }
+                    }
+                    
+                    // DELETE /v1/scenes/:uuid
+                    if request.url().contains("/scenes/") && request.method() == "DELETE" {
+                        let url_string = request.url().to_string();
+                        let url_parts: Vec<&str> = url_string.split('/').collect();
+                        if url_parts.len() >= 4 {
+                            let uuid = url_parts[3];
+                            if scenes_handler.delete_scene(uuid) {
+                                return Response::text(json!({ "status": "deleted" }).to_string());
+                            } else {
+                                return Response::text(json!({ "error": "Scene not found" }).to_string()).with_status_code(404);
+                            }
+                        }
+                    }
+                    
+                    // POST /v1/scenes/capture
+                    if request.url() == "/v1/scenes/capture" && request.method() == "POST" {
+                        let body = try_or_400!(rouille::input::plain_text_body(request));
+                        let input: serde_json::Value = try_or_400!(serde_json::from_str(&body));
+                        let name = input.get("name")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("Captured Scene")
+                            .to_string();
+                        
+                        let scene_response = scenes_handler.capture_current_state(mgr, name);
+                        return Response::json(&scene_response);
+                    }
+                    
                     // (PUT) SetStates
                     // https://api.lifx.com/v1/lights/states
                     if request.url().contains("/lights/states") && request.method() == "PUT" {
@@ -1470,8 +1549,61 @@ pub fn start(config: Config) {
         
                         // ListLights
                         // https://api.lifx.com/v1/lights/:selector
-                        if request.url().contains("/v1/lights/") && !request.url().contains("/state"){
+                        if request.url().contains("/v1/lights/") && !request.url().contains("/state") && !request.url().contains("/effects") && !request.url().contains("/cycle") && !request.url().contains("/clean"){
                             response = Response::json(&bulbs_vec.clone());
+                        }
+                        
+                        // Effects API endpoints
+                        // POST /v1/lights/:selector/effects/pulse
+                        if request.url().contains("/effects/pulse") && request.method() == "POST" {
+                            let body = try_or_400!(rouille::input::plain_text_body(request));
+                            let input: EffectRequest = try_or_400!(serde_json::from_str(&body));
+                            
+                            let handler = EffectsHandler::new();
+                            let effects_response = handler.handle_pulse(mgr, &bulbs_vec, input);
+                            response = Response::json(&effects_response);
+                        }
+                        
+                        // POST /v1/lights/:selector/effects/breathe
+                        if request.url().contains("/effects/breathe") && request.method() == "POST" {
+                            let body = try_or_400!(rouille::input::plain_text_body(request));
+                            let input: EffectRequest = try_or_400!(serde_json::from_str(&body));
+                            
+                            let handler = EffectsHandler::new();
+                            let effects_response = handler.handle_breathe(mgr, &bulbs_vec, input);
+                            response = Response::json(&effects_response);
+                        }
+                        
+                        // POST /v1/lights/:selector/effects/strobe
+                        if request.url().contains("/effects/strobe") && request.method() == "POST" {
+                            let body = try_or_400!(rouille::input::plain_text_body(request));
+                            let input: EffectRequest = try_or_400!(serde_json::from_str(&body));
+                            
+                            let handler = EffectsHandler::new();
+                            let effects_response = handler.handle_strobe(mgr, &bulbs_vec, input);
+                            response = Response::json(&effects_response);
+                        }
+                        
+                        // Cycle API endpoint
+                        // POST /v1/lights/:selector/cycle
+                        if request.url().contains("/cycle") && request.method() == "POST" {
+                            let body = try_or_400!(rouille::input::plain_text_body(request));
+                            let input: CycleRequest = try_or_400!(serde_json::from_str(&body));
+                            
+                            let handler = CycleHandler::new();
+                            let cycle_response = handler.handle_cycle(mgr, &bulbs_vec, input);
+                            response = Response::json(&cycle_response);
+                        }
+                        
+                        // Clean API endpoint
+                        // POST /v1/lights/:selector/clean
+                        if request.url().contains("/clean") && request.method() == "POST" {
+                            let body = try_or_400!(rouille::input::plain_text_body(request));
+                            let input: CleanRequest = try_or_400!(serde_json::from_str(&body));
+                            
+                            let handler = CleanHandler::new();
+                            let clean_response = handler.handle_clean(mgr, &bulbs_vec, input);
+                            response = Response::json(&clean_response);
                         }
                     } // Close the else block here
         
