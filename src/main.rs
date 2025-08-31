@@ -2,7 +2,7 @@ extern crate lifx_api_server;
 use std::env;
 use log::{info, error};
 
-fn main() {
+fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Initialize logger with environment variable control
     env_logger::init();
 
@@ -17,7 +17,10 @@ fn main() {
     }
 
  
-    let secret_key = env::var("SECRET_KEY").expect("$SECRET_KEY is not set");
+    let secret_key = env::var("SECRET_KEY").map_err(|e| {
+        error!("$SECRET_KEY is not set: {}", e);
+        e
+    })?;
 
     let config = lifx_api_server::Config { 
         secret_key: secret_key.to_string(),
@@ -59,6 +62,6 @@ fn main() {
     info!("Server started, entering main loop");
 
     loop {
-        
+        std::thread::sleep(std::time::Duration::from_secs(1));
     }
 }

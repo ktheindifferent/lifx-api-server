@@ -3,7 +3,8 @@ use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 use serde::{Deserialize, Serialize};
 use lifx_rs::lan::HSBK;
-use crate::{BulbInfo, Manager, LifxColor};
+use crate::{BulbInfo, Manager};
+use crate::error::{LifxError, Result};
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct Scene {
@@ -76,11 +77,11 @@ impl ScenesHandler {
         }
     }
 
-    pub fn create_scene(&self, request: CreateSceneRequest) -> SceneResponse {
+    pub fn create_scene(&self, request: CreateSceneRequest) -> Result<SceneResponse> {
         let uuid = self.generate_uuid();
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .unwrap()
+            .map_err(|e| LifxError::ValidationError(format!("Time error: {}", e)))?
             .as_secs();
         
         let scene = Scene {
@@ -91,27 +92,27 @@ impl ScenesHandler {
             updated_at: now,
         };
         
-        let mut scenes = self.scenes.lock().unwrap();
+        let mut scenes = self.scenes.lock()?;
         scenes.insert(uuid, scene.clone());
         
-        SceneResponse { scene }
+        Ok(SceneResponse { scene })
     }
 
-    pub fn list_scenes(&self) -> ScenesListResponse {
-        let scenes = self.scenes.lock().unwrap();
+    pub fn list_scenes(&self) -> Result<ScenesListResponse> {
+        let scenes = self.scenes.lock()?;
         let scenes_list: Vec<Scene> = scenes.values().cloned().collect();
         
-        ScenesListResponse { scenes: scenes_list }
+        Ok(ScenesListResponse { scenes: scenes_list })
     }
 
-    pub fn get_scene(&self, uuid: &str) -> Option<Scene> {
-        let scenes = self.scenes.lock().unwrap();
-        scenes.get(uuid).cloned()
+    pub fn get_scene(&self, uuid: &str) -> Result<Option<Scene>> {
+        let scenes = self.scenes.lock()?;
+        Ok(scenes.get(uuid).cloned())
     }
 
-    pub fn delete_scene(&self, uuid: &str) -> bool {
-        let mut scenes = self.scenes.lock().unwrap();
-        scenes.remove(uuid).is_some()
+    pub fn delete_scene(&self, uuid: &str) -> Result<bool> {
+        let mut scenes = self.scenes.lock()?;
+        Ok(scenes.remove(uuid).is_some())
     }
 
     pub fn activate_scene(
@@ -119,14 +120,14 @@ impl ScenesHandler {
         mgr: &Manager,
         uuid: &str,
         request: ActivateSceneRequest,
-    ) -> Result<ActivateSceneResponse, String> {
-        let scene = self.get_scene(uuid)
-            .ok_or_else(|| format!("Scene {} not found", uuid))?;
+    ) -> Result<ActivateSceneResponse> {
+        let scene = self.get_scene(uuid)?
+            .ok_or_else(|| LifxError::SceneNotFound(uuid.to_string()))?;
         
         let duration = (request.duration.unwrap_or(1.0) * 1000.0) as u32;
         let mut results = Vec::new();
         
-        let bulbs = mgr.bulbs.lock().unwrap();
+        let bulbs = mgr.bulbs.lock()?;
         
         for state in &scene.states {
             let matching_bulbs = self.filter_bulbs_by_selector(&bulbs, &state.selector);
@@ -145,8 +146,8 @@ impl ScenesHandler {
         Ok(ActivateSceneResponse { results })
     }
 
-    pub fn capture_current_state(&self, mgr: &Manager, name: String) -> SceneResponse {
-        let bulbs = mgr.bulbs.lock().unwrap();
+    pub fn capture_current_state(&self, mgr: &Manager, name: String) -> Result<SceneResponse> {
+        let bulbs = mgr.bulbs.lock()?;
         let mut states = Vec::new();
         
         for bulb in bulbs.values() {
@@ -175,7 +176,7 @@ impl ScenesHandler {
         bulb: &BulbInfo,
         state: &SceneState,
         duration: u32,
-    ) -> Result<(), String> {
+    ) -> Result<()> {
         if let Some(ref power) = state.power {
             let power_level = if power == "on" {
                 lifx_rs::lan::PowerLevel::Enabled
@@ -184,7 +185,7 @@ impl ScenesHandler {
             };
             
             bulb.set_power(&mgr.sock, power_level)
-                .map_err(|e| format!("Failed to set power: {:?}", e))?;
+                .map_err(|e| LifxError::FailureError(format!("Failed to set power: {:?}", e)))?;
         }
         
         if let Some(ref color) = state.color {
@@ -196,7 +197,7 @@ impl ScenesHandler {
             };
             
             bulb.set_color(&mgr.sock, hsbk, duration)
-                .map_err(|e| format!("Failed to set color: {:?}", e))?;
+                .map_err(|e| LifxError::FailureError(format!("Failed to set color: {:?}", e)))?;
         } else if state.brightness.is_some() || state.kelvin.is_some() {
             let current = bulb.lifx_color.as_ref();
             let hsbk = HSBK {
@@ -212,7 +213,7 @@ impl ScenesHandler {
             };
             
             bulb.set_color(&mgr.sock, hsbk, duration)
-                .map_err(|e| format!("Failed to set color: {:?}", e))?;
+                .map_err(|e| LifxError::FailureError(format!("Failed to set color: {:?}", e)))?;
         }
         
         Ok(())
@@ -315,7 +316,7 @@ mod tests {
             ],
         };
         
-        let response = handler.create_scene(request);
+        let response = handler.create_scene(request).unwrap();
         assert_eq!(response.scene.name, "Test Scene");
         assert_eq!(response.scene.states.len(), 1);
         assert!(response.scene.uuid.len() > 0);
@@ -331,10 +332,10 @@ mod tests {
                 name: format!("Scene {}", i),
                 states: vec![],
             };
-            handler.create_scene(request);
+            handler.create_scene(request).unwrap();
         }
         
-        let list = handler.list_scenes();
+        let list = handler.list_scenes().unwrap();
         assert_eq!(list.scenes.len(), 3);
     }
     
@@ -347,18 +348,18 @@ mod tests {
             states: vec![],
         };
         
-        let response = handler.create_scene(request);
+        let response = handler.create_scene(request).unwrap();
         let uuid = response.scene.uuid.clone();
         
         // Test get
-        let scene = handler.get_scene(&uuid);
+        let scene = handler.get_scene(&uuid).unwrap();
         assert!(scene.is_some());
         assert_eq!(scene.unwrap().name, "Test Scene");
         
         // Test delete
-        assert!(handler.delete_scene(&uuid));
-        assert!(handler.get_scene(&uuid).is_none());
-        assert!(!handler.delete_scene(&uuid)); // Should return false for non-existent
+        assert!(handler.delete_scene(&uuid).unwrap());
+        assert!(handler.get_scene(&uuid).unwrap().is_none());
+        assert!(!handler.delete_scene(&uuid).unwrap()); // Should return false for non-existent
     }
     
     #[test]
@@ -393,7 +394,7 @@ mod tests {
         };
         
         assert_eq!(state.selector, "id:123");
-        assert_eq!(state.power.unwrap(), "on");
-        assert_eq!(state.brightness.unwrap(), 1.0);
+        assert_eq!(state.power.as_ref().unwrap(), "on");
+        assert_eq!(state.brightness.as_ref().unwrap(), &1.0);
     }
 }

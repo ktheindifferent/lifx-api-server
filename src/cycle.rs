@@ -134,7 +134,7 @@ impl CycleHandler {
     ) -> Result<HSBK, String> {
         let mut hue = current.map_or(0, |c| c.hue);
         let mut saturation = current.map_or(0, |c| c.saturation);
-        let mut brightness = state.brightness
+        let brightness = state.brightness
             .or(default_brightness)
             .map(|b| (b * 65535.0) as u16)
             .or_else(|| current.map(|c| c.brightness))

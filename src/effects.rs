@@ -1,7 +1,6 @@
-use std::time::Duration;
 use serde::{Deserialize, Serialize};
 use lifx_rs::lan::{Waveform, HSBK, Message, BuildOptions, RawMessage};
-use crate::{BulbInfo, Manager, parse_f64_safe};
+use crate::{BulbInfo, Manager};
 
 #[derive(Deserialize, Debug, Clone)]
 pub struct EffectRequest {
@@ -104,7 +103,7 @@ impl EffectsHandler {
         let peak = request.peak.unwrap_or(0.5);
         
         let current_color = bulb.lifx_color.as_ref();
-        let from_color = self.parse_color_or_current(request.from_color.as_deref(), current_color)?;
+        let _from_color = self.parse_color_or_current(request.from_color.as_deref(), current_color)?;
         let to_color = self.parse_color_or_default(request.color.as_deref(), current_color)?;
         
         let transient = !request.persist.unwrap_or(false);

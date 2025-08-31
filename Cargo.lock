@@ -785,6 +785,7 @@ dependencies = [
  "serde_derive",
  "serde_json",
  "sudo",
+ "thiserror",
 ]
 
 [[package]]
