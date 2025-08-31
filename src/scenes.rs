@@ -3,8 +3,10 @@ use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 use serde::{Deserialize, Serialize};
 use lifx_rs::lan::HSBK;
-use crate::{BulbInfo, Manager};
+use crate::{BulbInfo, Manager, LifxColor};
 use crate::error::{LifxError, Result};
+use crate::mutex_utils::{safe_lock, safe_lock_monitored};
+use log::error;
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct Scene {
@@ -92,14 +94,14 @@ impl ScenesHandler {
             updated_at: now,
         };
         
-        let mut scenes = self.scenes.lock()?;
+        let mut scenes = self.scenes.lock()?
         scenes.insert(uuid, scene.clone());
         
         Ok(SceneResponse { scene })
     }
 
     pub fn list_scenes(&self) -> Result<ScenesListResponse> {
-        let scenes = self.scenes.lock()?;
+        let scenes = self.scenes.lock()?
         let scenes_list: Vec<Scene> = scenes.values().cloned().collect();
         
         Ok(ScenesListResponse { scenes: scenes_list })
@@ -127,7 +129,7 @@ impl ScenesHandler {
         let duration = (request.duration.unwrap_or(1.0) * 1000.0) as u32;
         let mut results = Vec::new();
         
-        let bulbs = mgr.bulbs.lock()?;
+        let bulbs = mgr.bulbs.lock()?
         
         for state in &scene.states {
             let matching_bulbs = self.filter_bulbs_by_selector(&bulbs, &state.selector);
@@ -147,7 +149,7 @@ impl ScenesHandler {
     }
 
     pub fn capture_current_state(&self, mgr: &Manager, name: String) -> Result<SceneResponse> {
-        let bulbs = mgr.bulbs.lock()?;
+        let bulbs = mgr.bulbs.lock()?
         let mut states = Vec::new();
         
         for bulb in bulbs.values() {

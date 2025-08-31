@@ -776,6 +776,7 @@ dependencies = [
  "env_logger",
  "failure",
  "get_if_addrs",
+ "lazy_static",
  "lifx-rs",
  "log",
  "palette",

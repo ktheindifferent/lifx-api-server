@@ -15,19 +15,38 @@ Add the following line to your cargo.toml:
 lifx-api-server = "0.1.15"
 ```
 
+### Authentication
+
+The server supports flexible authentication configuration:
+
+1. **With Authentication (Production)**: Set the `SECRET_KEY` environment variable
+   ```bash
+   SECRET_KEY=your-secret-key cargo run
+   ```
+
+2. **Development Mode**: Auto-generates a random key
+   ```bash
+   LIFX_API_MODE=development cargo run
+   ```
+
+3. **Without Authentication**: Don't set `SECRET_KEY` (use only in trusted environments)
+   ```bash
+   cargo run
+   ```
+
 ### Example:
 ```rust
 extern crate lifx_api_server;
 
 fn main() {
-
+    // Authentication is now optional
     let config = lifx_api_server::Config { 
-        secret_key: format!("xxx"),
-        port: 8089
+        secret_key: Some("xxx".to_string()),  // Or None to disable auth
+        port: 8089,
+        auth_required: true,  // Set to false for public access
     };
 
     lifx_api_server::start(config);
-
 
     println!("sync");
 

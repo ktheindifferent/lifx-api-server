@@ -1,6 +1,8 @@
 extern crate lifx_api_server;
 use std::env;
-use log::{info, error};
+use log::{info, warn, error};
+use rand::{thread_rng, Rng};
+use rand::distributions::Alphanumeric;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Initialize logger with environment variable control
@@ -17,14 +19,48 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
  
-    let secret_key = env::var("SECRET_KEY").map_err(|e| {
-        error!("$SECRET_KEY is not set: {}", e);
-        e
-    })?;
+    let (secret_key, auth_required) = match env::var("SECRET_KEY") {
+        Ok(key) if !key.is_empty() => {
+            info!("Authentication enabled with provided SECRET_KEY");
+            (Some(key), true)
+        },
+        Ok(_) => {
+            // Empty SECRET_KEY means auth disabled
+            warn!("SECRET_KEY is empty - authentication disabled!");
+            warn!("WARNING: API is accessible without authentication. Use only in trusted environments.");
+            (None, false)
+        },
+        Err(_) => {
+            // Check if we're in development mode
+            match env::var("LIFX_API_MODE") {
+                Ok(mode) if mode == "development" => {
+                    // Generate a random key for development
+                    let random_key: String = thread_rng()
+                        .sample_iter(&Alphanumeric)
+                        .take(32)
+                        .map(char::from)
+                        .collect();
+                    warn!("SECRET_KEY not set - generated random key for development mode");
+                    warn!("Generated key: {}", random_key);
+                    warn!("Set SECRET_KEY environment variable for production use");
+                    (Some(random_key), true)
+                },
+                _ => {
+                    // Production mode - authentication disabled with warning
+                    warn!("SECRET_KEY not set - authentication disabled!");
+                    warn!("WARNING: API is accessible without authentication.");
+                    warn!("For production use, set SECRET_KEY environment variable.");
+                    warn!("To enable development mode with auto-generated key, set LIFX_API_MODE=development");
+                    (None, false)
+                }
+            }
+        }
+    };
 
     let config = lifx_api_server::Config { 
-        secret_key: secret_key.to_string(),
-        port: 8000
+        secret_key,
+        port: 8000,
+        auth_required
     };
 
     info!("Starting LIFX API server on port {}", config.port);
