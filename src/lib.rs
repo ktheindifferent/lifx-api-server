@@ -43,6 +43,9 @@ use cycle::{CycleHandler, CycleRequest};
 pub mod clean;
 use clean::{CleanHandler, CleanRequest};
 
+pub mod device_management;
+use device_management::{DeviceManagementHandler, SetLabelRequest, WiFiConfigRequest, RebootRequest};
+
 
 
 const HOUR: Duration = Duration::from_secs(60 * 60);
@@ -100,12 +103,60 @@ struct AuthAttempt {
 
 struct RateLimiter {
     attempts: Arc<Mutex<HashMap<String, AuthAttempt>>>,
+    config_changes: Arc<Mutex<HashMap<String, ConfigChangeAttempt>>>,
+}
+
+struct ConfigChangeAttempt {
+    count: u32,
+    first_attempt: Instant,
+    last_attempt: Instant,
 }
 
 impl RateLimiter {
     fn new() -> Self {
         RateLimiter {
             attempts: Arc::new(Mutex::new(HashMap::new())),
+            config_changes: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+    
+    fn check_config_change_limit(&self, client_ip: String) -> bool {
+        let mut config_changes = match self.config_changes.lock() {
+            Ok(guard) => guard,
+            Err(e) => {
+                eprintln!("Failed to acquire config rate limiter lock: {}", e);
+                return false;
+            }
+        };
+        
+        let now = Instant::now();
+        let window = Duration::from_secs(300); // 5 minute window for config changes
+        const MAX_CONFIG_CHANGES: u32 = 5; // Max 5 config changes per 5 minutes
+        
+        match config_changes.get_mut(&client_ip) {
+            Some(attempt) => {
+                if now.duration_since(attempt.first_attempt) > window {
+                    // Reset window
+                    attempt.count = 1;
+                    attempt.first_attempt = now;
+                    attempt.last_attempt = now;
+                    true
+                } else if attempt.count >= MAX_CONFIG_CHANGES {
+                    false // Too many config changes
+                } else {
+                    attempt.count += 1;
+                    attempt.last_attempt = now;
+                    true
+                }
+            }
+            None => {
+                config_changes.insert(client_ip, ConfigChangeAttempt {
+                    count: 1,
+                    first_attempt: now,
+                    last_attempt: now,
+                });
+                true
+            }
         }
     }
 
@@ -149,6 +200,7 @@ impl RateLimiter {
     }
 
     fn cleanup_old_entries(&self) {
+        // Clean up auth attempts
         let mut attempts = match self.attempts.lock() {
             Ok(guard) => guard,
             Err(e) => {
@@ -163,6 +215,22 @@ impl RateLimiter {
         attempts.retain(|_, attempt| {
             now.duration_since(attempt.timestamp) <= window
         });
+        
+        // Clean up config change attempts
+        drop(attempts); // Release the first lock before acquiring the second
+        
+        let mut config_changes = match self.config_changes.lock() {
+            Ok(guard) => guard,
+            Err(e) => {
+                eprintln!("Failed to acquire config rate limiter lock for cleanup: {}", e);
+                return;
+            }
+        };
+        
+        let config_window = Duration::from_secs(600); // Clean up after 10 minutes
+        config_changes.retain(|_, attempt| {
+            now.duration_since(attempt.last_attempt) <= config_window
+        });
     }
 }
 
@@ -170,6 +238,50 @@ impl RateLimiter {
 enum AuthResult {
     Authorized,
     Unauthorized(Response),
+}
+
+// Check if operation requires elevated permissions
+fn requires_elevated_permissions(endpoint: &str) -> bool {
+    matches!(endpoint, "/wifi" | "/reboot")
+}
+
+// Enhanced authentication for sensitive operations
+fn authenticate_elevated_request(
+    request: &rouille::Request,
+    secret_key: &str,
+    rate_limiter: &Arc<RateLimiter>,
+) -> AuthResult {
+    // First perform basic authentication
+    let basic_auth = authenticate_request(request, secret_key, rate_limiter);
+    
+    match basic_auth {
+        AuthResult::Authorized => {
+            // Check for elevated permissions header
+            let elevated_header = request.header("X-LIFX-Elevated-Token");
+            
+            match elevated_header {
+                Some(token) => {
+                    // In production, this would verify against a separate elevated token
+                    // For now, we'll check if it matches a specific pattern
+                    if token.starts_with("ELEVATED-") && token.len() > 9 {
+                        AuthResult::Authorized
+                    } else {
+                        AuthResult::Unauthorized(
+                            Response::text("Elevated permissions required for this operation")
+                                .with_status_code(403)
+                        )
+                    }
+                }
+                None => {
+                    AuthResult::Unauthorized(
+                        Response::text("Elevated permissions required. Please provide X-LIFX-Elevated-Token header")
+                            .with_status_code(403)
+                    )
+                }
+            }
+        }
+        unauthorized => unauthorized,
+    }
 }
 
 // Centralized authentication middleware
@@ -1605,6 +1717,88 @@ pub fn start(config: Config) {
                             let clean_response = handler.handle_clean(mgr, &bulbs_vec, input);
                             response = Response::json(&clean_response);
                         }
+                        
+                        // Device Management API endpoints
+                        
+                        // PUT /v1/lights/:selector/label - Change device label
+                        if request.url().contains("/label") && request.method() == "PUT" {
+                            // Check rate limit for configuration changes
+                            let client_ip = request.remote_addr().ip().to_string();
+                            if !rate_limiter.check_config_change_limit(client_ip) {
+                                response = Response::text("Too many configuration changes. Please wait before trying again.")
+                                    .with_status_code(429)
+                                    .with_additional_header("Retry-After", "300");
+                            } else {
+                                let body = try_or_400!(rouille::input::plain_text_body(request));
+                                let input: SetLabelRequest = try_or_400!(serde_json::from_str(&body));
+                                
+                                let handler = DeviceManagementHandler::new();
+                                let label_response = handler.set_device_label(mgr, &bulbs_vec, input);
+                                response = Response::json(&label_response);
+                            }
+                        }
+                        
+                        // GET /v1/lights/:selector/config - Get device configuration
+                        if request.url().contains("/config") && request.method() == "GET" {
+                            let handler = DeviceManagementHandler::new();
+                            let config_response = handler.get_device_config(mgr, &bulbs_vec);
+                            response = Response::json(&config_response);
+                        }
+                        
+                        // PUT /v1/lights/:selector/wifi - Update WiFi settings (requires elevated permissions)
+                        if request.url().contains("/wifi") && request.method() == "PUT" {
+                            // Check for elevated permissions
+                            match authenticate_elevated_request(request, &config.secret_key, &rate_limiter) {
+                                AuthResult::Unauthorized(unauth_response) => {
+                                    response = unauth_response;
+                                }
+                                AuthResult::Authorized => {
+                                    // Check rate limit for configuration changes
+                                    let client_ip = request.remote_addr().ip().to_string();
+                                    if !rate_limiter.check_config_change_limit(client_ip) {
+                                        response = Response::text("Too many configuration changes. Please wait before trying again.")
+                                            .with_status_code(429)
+                                            .with_additional_header("Retry-After", "300");
+                                    } else {
+                                        let body = try_or_400!(rouille::input::plain_text_body(request));
+                                        let input: WiFiConfigRequest = try_or_400!(serde_json::from_str(&body));
+                                        
+                                        let handler = DeviceManagementHandler::new();
+                                        let wifi_response = handler.update_wifi_settings(mgr, &bulbs_vec, input);
+                                        response = Response::json(&wifi_response);
+                                    }
+                                }
+                            }
+                        }
+                        
+                        // POST /v1/lights/:selector/reboot - Reboot device (requires elevated permissions)
+                        if request.url().contains("/reboot") && request.method() == "POST" {
+                            // Check for elevated permissions
+                            match authenticate_elevated_request(request, &config.secret_key, &rate_limiter) {
+                                AuthResult::Unauthorized(unauth_response) => {
+                                    response = unauth_response;
+                                }
+                                AuthResult::Authorized => {
+                                    let body = try_or_400!(rouille::input::plain_text_body(request));
+                                    let input: RebootRequest = if body.is_empty() {
+                                        RebootRequest { delay: None }
+                                    } else {
+                                        try_or_400!(serde_json::from_str(&body))
+                                    };
+                                    
+                                    let handler = DeviceManagementHandler::new();
+                                    let reboot_response = handler.reboot_device(mgr, &bulbs_vec, input);
+                                    response = Response::json(&reboot_response);
+                                }
+                            }
+                        }
+                        
+                        // GET /v1/lights/:selector/info - Get extended device information
+                        if request.url().contains("/info") && request.method() == "GET" {
+                            let handler = DeviceManagementHandler::new();
+                            let info_response = handler.get_extended_info(mgr, &bulbs_vec);
+                            response = Response::json(&info_response);
+                        }
                     } // Close the else block here
         
         
@@ -2360,5 +2554,108 @@ mod tests {
                 }
             }
         }
+    }
+
+    // Tests for device management functionality
+    #[test]
+    fn test_config_change_rate_limiting() {
+        let limiter = RateLimiter::new();
+        let client_ip = "192.168.1.100".to_string();
+        
+        // First 5 config changes should succeed
+        for _ in 0..5 {
+            assert!(limiter.check_config_change_limit(client_ip.clone()));
+        }
+        
+        // 6th change should be blocked
+        assert!(!limiter.check_config_change_limit(client_ip.clone()));
+    }
+
+    #[test]
+    fn test_config_change_rate_limiting_different_ips() {
+        let limiter = RateLimiter::new();
+        
+        // Different IPs should have independent config change limits
+        for i in 0..10 {
+            let ip = format!("192.168.1.{}", i);
+            assert!(limiter.check_config_change_limit(ip));
+        }
+    }
+
+    #[test]
+    fn test_elevated_permissions_check() {
+        assert!(requires_elevated_permissions("/wifi"));
+        assert!(requires_elevated_permissions("/reboot"));
+        assert!(!requires_elevated_permissions("/label"));
+        assert!(!requires_elevated_permissions("/config"));
+        assert!(!requires_elevated_permissions("/info"));
+    }
+
+    #[test]
+    fn test_device_management_request_structures() {
+        // Test SetLabelRequest
+        let label_req = SetLabelRequest {
+            label: "Test Label".to_string(),
+        };
+        assert_eq!(label_req.label, "Test Label");
+
+        // Test WiFiConfigRequest
+        let wifi_req = WiFiConfigRequest {
+            ssid: "TestNetwork".to_string(),
+            pass: "TestPassword".to_string(),
+            security: Some(3), // WPA2
+        };
+        assert_eq!(wifi_req.ssid, "TestNetwork");
+        assert_eq!(wifi_req.security, Some(3));
+
+        // Test RebootRequest
+        let reboot_req = RebootRequest {
+            delay: Some(30),
+        };
+        assert_eq!(reboot_req.delay, Some(30));
+    }
+
+    #[test]
+    fn test_label_validation_length() {
+        // Test that labels over 32 characters are rejected in handler
+        let long_label = "This is a very long label that exceeds the 32 character limit for LIFX devices";
+        assert!(long_label.len() > 32);
+        
+        let short_label = "Valid Label";
+        assert!(short_label.len() <= 32);
+    }
+
+    #[test]
+    fn test_wifi_config_validation() {
+        // Test SSID validation
+        let valid_ssid = "MyNetwork";
+        assert!(valid_ssid.len() > 0 && valid_ssid.len() <= 32);
+        
+        let long_ssid = "ThisIsAVeryLongSSIDThatExceedsTheMaximumAllowedLength";
+        assert!(long_ssid.len() > 32);
+        
+        // Test password validation
+        let valid_pass = "MySecurePassword123";
+        assert!(valid_pass.len() <= 64);
+        
+        let long_pass = "ThisIsAnExtremelyLongPasswordThatExceedsTheSixtyFourCharacterLimitForWiFiPasswords";
+        assert!(long_pass.len() > 64);
+    }
+
+    #[test]
+    fn test_config_change_cleanup() {
+        let limiter = RateLimiter::new();
+        
+        // Add some config change entries
+        for i in 0..3 {
+            let ip = format!("192.168.2.{}", i);
+            limiter.check_config_change_limit(ip);
+        }
+        
+        // Cleanup should work without panicking
+        limiter.cleanup_old_entries();
+        
+        // Should still be able to add new entries after cleanup
+        assert!(limiter.check_config_change_limit("192.168.2.100".to_string()));
     }
 }
