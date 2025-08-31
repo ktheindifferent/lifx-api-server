@@ -4,6 +4,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use serde::{Deserialize, Serialize};
 use lifx_rs::lan::HSBK;
 use crate::{BulbInfo, Manager, LifxColor};
+use crate::mutex_utils::{safe_lock, safe_lock_monitored};
+use log::error;
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct Scene {
@@ -91,26 +93,51 @@ impl ScenesHandler {
             updated_at: now,
         };
         
-        let mut scenes = self.scenes.lock().unwrap();
+        let mut scenes = match safe_lock_monitored(&self.scenes, "scenes_create") {
+            Ok(guard) => guard,
+            Err(e) => {
+                error!("Failed to lock scenes mutex: {}", e);
+                // Return the scene we already created, even though we couldn't store it
+                return SceneResponse { scene };
+            }
+        };
         scenes.insert(uuid, scene.clone());
         
         SceneResponse { scene }
     }
 
     pub fn list_scenes(&self) -> ScenesListResponse {
-        let scenes = self.scenes.lock().unwrap();
+        let scenes = match safe_lock_monitored(&self.scenes, "scenes_list") {
+            Ok(guard) => guard,
+            Err(e) => {
+                error!("Failed to lock scenes mutex: {}", e);
+                return ScenesListResponse { scenes: Vec::new() };
+            }
+        };
         let scenes_list: Vec<Scene> = scenes.values().cloned().collect();
         
         ScenesListResponse { scenes: scenes_list }
     }
 
     pub fn get_scene(&self, uuid: &str) -> Option<Scene> {
-        let scenes = self.scenes.lock().unwrap();
+        let scenes = match safe_lock_monitored(&self.scenes, "scenes_get") {
+            Ok(guard) => guard,
+            Err(e) => {
+                error!("Failed to lock scenes mutex: {}", e);
+                return None;
+            }
+        };
         scenes.get(uuid).cloned()
     }
 
     pub fn delete_scene(&self, uuid: &str) -> bool {
-        let mut scenes = self.scenes.lock().unwrap();
+        let mut scenes = match safe_lock_monitored(&self.scenes, "scenes_delete") {
+            Ok(guard) => guard,
+            Err(e) => {
+                error!("Failed to lock scenes mutex: {}", e);
+                return false;
+            }
+        };
         scenes.remove(uuid).is_some()
     }
 
@@ -126,7 +153,12 @@ impl ScenesHandler {
         let duration = (request.duration.unwrap_or(1.0) * 1000.0) as u32;
         let mut results = Vec::new();
         
-        let bulbs = mgr.bulbs.lock().unwrap();
+        let bulbs = match safe_lock_monitored(&mgr.bulbs, "scenes_activate") {
+            Ok(guard) => guard,
+            Err(e) => {
+                return Err(format!("Failed to lock bulbs mutex: {}", e));
+            }
+        };
         
         for state in &scene.states {
             let matching_bulbs = self.filter_bulbs_by_selector(&bulbs, &state.selector);
@@ -146,7 +178,13 @@ impl ScenesHandler {
     }
 
     pub fn capture_current_state(&self, mgr: &Manager, name: String) -> SceneResponse {
-        let bulbs = mgr.bulbs.lock().unwrap();
+        let bulbs = match safe_lock_monitored(&mgr.bulbs, "scenes_capture") {
+            Ok(guard) => guard,
+            Err(e) => {
+                error!("Failed to lock bulbs mutex: {}", e);
+                return self.create_scene(CreateSceneRequest { name, states: Vec::new() });
+            }
+        };
         let mut states = Vec::new();
         
         for bulb in bulbs.values() {
