@@ -59,7 +59,7 @@ fn test_malformed_auth_header() {
 
 // Manual testing script for authentication
 // To manually test the authentication:
-// 
+//
 // 1. Start the server with a known secret key:
 //    SECRET_KEY=test_secret cargo run
 //
@@ -73,7 +73,7 @@ fn test_malformed_auth_header() {
 //    curl -v -H "Authorization: Bearer test_secret" http://localhost:8000/v1/lights/all
 //
 // 5. Test rate limiting (should return 429 after 5 attempts):
-//    for i in {1..10}; do 
+//    for i in {1..10}; do
 //      curl -v -H "Authorization: Bearer wrong" http://localhost:8000/v1/lights/all
 //    done
 //

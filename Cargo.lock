@@ -244,6 +244,7 @@ dependencies = [
  "libc",
  "num-integer",
  "num-traits",
+ "time 0.1.43",
  "winapi 0.3.9",
 ]
 
@@ -772,6 +773,7 @@ checksum = "e74d72e0f9b65b5b4ca49a346af3976df0f9c61d550727f349ecd559f251a26c"
 name = "lifx-api-server"
 version = "0.1.15"
 dependencies = [
+ "chrono",
  "colors-transform",
  "env_logger",
  "failure",
@@ -1345,7 +1347,7 @@ dependencies = [
  "serde_json",
  "sha1_smol",
  "threadpool",
- "time",
+ "time 0.3.41",
  "tiny_http",
  "url",
 ]
@@ -1569,6 +1571,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d050e60b33d41c19108b32cea32164033a9013fe3b46cbd4457559bfbf77afaa"
 dependencies = [
  "num_cpus",
+]
+
+[[package]]
+name = "time"
+version = "0.1.43"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ca8a50ef2360fbd1eeb0ecd46795a87a19024eb4b53c5dc916ca1fd95fe62438"
+dependencies = [
+ "libc",
+ "winapi 0.3.9",
 ]
 
 [[package]]

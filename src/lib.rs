@@ -3,39 +3,40 @@
 // TODO - Impliment LIFX Effects, Scenes, Clean, Cycle (DONE)
 // TODO - Impliment an extended API for changing device labels, wifi-config, etc.
 
-
 use get_if_addrs::{get_if_addrs, IfAddr, Ifv4Addr};
-use lifx_rs::lan::{get_product_info, BuildOptions, Message, PowerLevel, ProductInfo, RawMessage, HSBK};
+use lifx_rs::lan::{
+    get_product_info, BuildOptions, Message, PowerLevel, ProductInfo, RawMessage, HSBK,
+};
+use log::{debug, error, info, warn};
+use rand::distributions::Alphanumeric;
+use rand::{thread_rng, Rng};
+use rouille::try_or_400;
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr, UdpSocket};
 use std::sync::{Arc, Mutex};
-use std::thread::{spawn};
-use std::time::{Duration, Instant};
-use rouille::try_or_400;
-use rand::{thread_rng, Rng};
-use rand::distributions::Alphanumeric;
 use std::thread;
-use log::{debug, info, warn, error};
+use std::thread::spawn;
+use std::time::{Duration, Instant};
 
-use rouille::Response;
 use rouille::post_input;
+use rouille::Response;
 
-
-use serde::{Serialize, Deserialize};
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 
-use palette::{Hsv, Srgb, IntoColor};
+use palette::{Hsv, IntoColor, Srgb};
 
-use colors_transform::{Rgb, Color};
+use chrono;
+use colors_transform::{Color, Rgb};
 
 pub mod set_states;
 use set_states::{SetStatesHandler, StatesRequest};
 
 pub mod effects;
-use effects::{EffectsHandler, EffectRequest};
+use effects::{EffectRequest, EffectsHandler};
 
 pub mod scenes;
-use scenes::{ScenesHandler, CreateSceneRequest, ActivateSceneRequest};
+use scenes::{ActivateSceneRequest, CreateSceneRequest, ScenesHandler};
 
 pub mod cycle;
 use cycle::{CycleHandler, CycleRequest};
@@ -43,23 +44,24 @@ use cycle::{CycleHandler, CycleRequest};
 pub mod clean;
 use clean::{CleanHandler, CleanRequest};
 
-
-
 const HOUR: Duration = Duration::from_secs(60 * 60);
 
 // Helper functions for safe parsing
 fn parse_u16_safe(value: &str) -> Result<u16, String> {
-    value.parse::<u16>()
+    value
+        .parse::<u16>()
         .map_err(|_| format!("Invalid u16 value: {}", value))
 }
 
 fn parse_f64_safe(value: &str) -> Result<f64, String> {
-    value.parse::<f64>()
+    value
+        .parse::<f64>()
         .map_err(|_| format!("Invalid f64 value: {}", value))
 }
 
 fn parse_i64_safe(value: &str) -> Result<i64, String> {
-    value.parse::<i64>()
+    value
+        .parse::<i64>()
         .map_err(|_| format!("Invalid i64 value: {}", value))
 }
 
@@ -70,7 +72,7 @@ const AUTH_WINDOW_SECONDS: u64 = 60;
 // LIFX Protocol Color Conversion Constants
 // The LIFX protocol represents HSBK values as 16-bit unsigned integers (0-65535)
 // instead of standard ranges (Hue: 0-360°, Saturation/Brightness: 0-100%)
-// 
+//
 // According to LIFX protocol documentation, they recommend using 0x10000 (65536)
 // for hue conversion to achieve consistent rounding behavior
 const LIFX_HUE_MAX: f32 = 65536.0; // 0x10000 for consistent rounding as per LIFX docs
@@ -82,14 +84,14 @@ const LIFX_BRIGHTNESS_MAX: f32 = 65535.0; // 0xFFFF
 
 // Pre-calculated LIFX hue values for named colors (in u16 format)
 // These are calculated using: hue_u16 = (degrees * 65536 / 360) % 65536
-const HUE_RED: u16 = 0;        // 0°
-const HUE_ORANGE: u16 = 7099;  // ~39°
+const HUE_RED: u16 = 0; // 0°
+const HUE_ORANGE: u16 = 7099; // ~39°
 const HUE_YELLOW: u16 = 10922; // 60°
-const HUE_GREEN: u16 = 21845;  // 120°
-const HUE_CYAN: u16 = 32768;   // 180°
-const HUE_BLUE: u16 = 43690;   // 240°
+const HUE_GREEN: u16 = 21845; // 120°
+const HUE_CYAN: u16 = 32768; // 180°
+const HUE_BLUE: u16 = 43690; // 240°
 const HUE_PURPLE: u16 = 50062; // ~275°
-const HUE_PINK: u16 = 63715;   // ~350°
+const HUE_PINK: u16 = 63715; // ~350°
 
 // Simple rate limiter for authentication attempts
 #[derive(Debug, Clone)]
@@ -120,7 +122,7 @@ impl RateLimiter {
         };
         let now = Instant::now();
         let window = Duration::from_secs(AUTH_WINDOW_SECONDS);
-        
+
         match attempts.get_mut(&client_ip) {
             Some(attempt) => {
                 if now.duration_since(attempt.timestamp) > window {
@@ -139,10 +141,13 @@ impl RateLimiter {
             }
             None => {
                 // First attempt
-                attempts.insert(client_ip, AuthAttempt {
-                    timestamp: now,
-                    count: 1,
-                });
+                attempts.insert(
+                    client_ip,
+                    AuthAttempt {
+                        timestamp: now,
+                        count: 1,
+                    },
+                );
                 true
             }
         }
@@ -159,10 +164,8 @@ impl RateLimiter {
         };
         let now = Instant::now();
         let window = Duration::from_secs(AUTH_WINDOW_SECONDS * 2);
-        
-        attempts.retain(|_, attempt| {
-            now.duration_since(attempt.timestamp) <= window
-        });
+
+        attempts.retain(|_, attempt| now.duration_since(attempt.timestamp) <= window);
     }
 }
 
@@ -180,10 +183,10 @@ fn authenticate_request(
 ) -> AuthResult {
     // Extract client IP for rate limiting
     let client_ip = request.remote_addr().ip().to_string();
-    
+
     // Get authorization header
     let auth_header = request.header("Authorization");
-    
+
     match auth_header {
         None => {
             // Check rate limit for failed auth attempts
@@ -191,15 +194,15 @@ fn authenticate_request(
                 return AuthResult::Unauthorized(
                     Response::text("Too many authentication attempts. Please try again later.")
                         .with_status_code(429)
-                        .with_additional_header("Retry-After", "60")
+                        .with_additional_header("Retry-After", "60"),
                 );
             }
-            
+
             // Return 401 Unauthorized when no auth header is present
             AuthResult::Unauthorized(
                 Response::text("Unauthorized: Missing Authorization header")
                     .with_status_code(401)
-                    .with_additional_header("WWW-Authenticate", "Bearer realm=\"LIFX API\"")
+                    .with_additional_header("WWW-Authenticate", "Bearer realm=\"LIFX API\""),
             )
         }
         Some(auth_value) => {
@@ -211,15 +214,15 @@ fn authenticate_request(
                     return AuthResult::Unauthorized(
                         Response::text("Too many authentication attempts. Please try again later.")
                             .with_status_code(429)
-                            .with_additional_header("Retry-After", "60")
+                            .with_additional_header("Retry-After", "60"),
                     );
                 }
-                
+
                 // Return 401 Unauthorized for invalid token
                 AuthResult::Unauthorized(
                     Response::text("Unauthorized: Invalid token")
                         .with_status_code(401)
-                        .with_additional_header("WWW-Authenticate", "Bearer realm=\"LIFX API\"")
+                        .with_additional_header("WWW-Authenticate", "Bearer realm=\"LIFX API\""),
                 )
             } else {
                 AuthResult::Authorized
@@ -248,8 +251,6 @@ impl<T> RefreshableData<T> {
     fn update(&mut self, data: T) {
         self.data = Some(data);
         self.last_updated = Instant::now();
-
-
     }
     fn needs_refresh(&self) -> bool {
         self.data.is_none() || self.last_updated.elapsed() > self.max_age
@@ -280,7 +281,6 @@ pub struct BulbInfo {
     pub seconds_since_seen: i64,
     // pub error: Option<String>,
     // pub errors: Option<Vec<Error>>,
-
     #[serde(skip_serializing)]
     last_seen: Instant,
 
@@ -292,7 +292,6 @@ pub struct BulbInfo {
 
     #[serde(skip_serializing)]
     group: RefreshableData<LifxGroup>,
-
 
     #[serde(skip_serializing)]
     name: RefreshableData<String>,
@@ -310,8 +309,7 @@ pub struct BulbInfo {
     color: LiColor,
 }
 
-#[derive(Debug)]
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 enum LiColor {
     Unknown,
     Single(RefreshableData<HSBK>),
@@ -349,8 +347,16 @@ pub struct LifxGroup {
 
 impl BulbInfo {
     fn new(source: u32, target: u64, addr: SocketAddr) -> BulbInfo {
-        let id: String = thread_rng().sample_iter(&Alphanumeric).take(12).map(char::from).collect();
-        let uuid: String = thread_rng().sample_iter(&Alphanumeric).take(30).map(char::from).collect();
+        let id: String = thread_rng()
+            .sample_iter(&Alphanumeric)
+            .take(12)
+            .map(char::from)
+            .collect();
+        let uuid: String = thread_rng()
+            .sample_iter(&Alphanumeric)
+            .take(30)
+            .map(char::from)
+            .collect();
         BulbInfo {
             id: id.to_string(),
             uuid: uuid.to_string(),
@@ -402,64 +408,61 @@ impl BulbInfo {
         Ok(())
     }
 
-    fn set_power(
-        &self,
-        sock: &UdpSocket,
-        power_level: PowerLevel,
-    ) -> Result<(), failure::Error> {
-        
+    fn set_power(&self, sock: &UdpSocket, power_level: PowerLevel) -> Result<(), failure::Error> {
         let options = BuildOptions {
             target: Some(self.target),
             res_required: true,
             source: self.source,
             ..Default::default()
         };
-        let message = RawMessage::build(&options, Message::SetPower{level: power_level})?;
+        let message = RawMessage::build(&options, Message::SetPower { level: power_level })?;
         sock.send_to(&message.pack()?, self.addr)?;
-  
+
         Ok(())
     }
 
-    fn set_infrared(
-        &self,
-        sock: &UdpSocket,
-        brightness: u16,
-    ) -> Result<(), failure::Error> {
-        
+    fn set_infrared(&self, sock: &UdpSocket, brightness: u16) -> Result<(), failure::Error> {
         let options = BuildOptions {
             target: Some(self.target),
             res_required: true,
             source: self.source,
             ..Default::default()
         };
-        let message = RawMessage::build(&options, Message::LightSetInfrared{brightness: brightness})?;
+        let message = RawMessage::build(
+            &options,
+            Message::LightSetInfrared {
+                brightness: brightness,
+            },
+        )?;
         sock.send_to(&message.pack()?, self.addr)?;
-  
+
         Ok(())
     }
-
 
     fn set_color(
         &self,
         sock: &UdpSocket,
         color: HSBK,
-        duration: u32
+        duration: u32,
     ) -> Result<(), failure::Error> {
-        
         let options = BuildOptions {
             target: Some(self.target),
             res_required: true,
             source: self.source,
             ..Default::default()
         };
-        let message = RawMessage::build(&options, Message::LightSetColor{reserved: 0, color: color, duration: duration})?;
+        let message = RawMessage::build(
+            &options,
+            Message::LightSetColor {
+                reserved: 0,
+                color: color,
+                duration: duration,
+            },
+        )?;
         sock.send_to(&message.pack()?, self.addr)?;
-  
+
         Ok(())
     }
-
-
-
 
     fn query_for_missing_info(&self, sock: &UdpSocket) -> Result<(), failure::Error> {
         self.refresh_if_needed(sock, &self.name)?;
@@ -474,8 +477,6 @@ impl BulbInfo {
             LiColor::Single(d) => self.refresh_if_needed(sock, d)?,
             LiColor::Multi(d) => self.refresh_if_needed(sock, d)?,
         }
-
-    
 
         Ok(())
     }
@@ -548,6 +549,17 @@ pub struct Manager {
     pub last_discovery: Instant,
     pub sock: UdpSocket,
     pub source: u32,
+    pub discovery_metrics: Arc<Mutex<DiscoveryMetrics>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DiscoveryMetrics {
+    pub total_discoveries: u64,
+    pub successful_discoveries: u64,
+    pub failed_discoveries: u64,
+    pub last_discovery_time: Option<String>,
+    pub last_discovery_status: Option<String>,
+    pub devices_discovered: usize,
 }
 
 impl Manager {
@@ -565,11 +577,21 @@ impl Manager {
         // spawn a thread that will receive data from our socket and update our internal data structures
         spawn(move || Self::worker(recv_sock, source, receiver_bulbs));
 
+        let discovery_metrics = Arc::new(Mutex::new(DiscoveryMetrics {
+            total_discoveries: 0,
+            successful_discoveries: 0,
+            failed_discoveries: 0,
+            last_discovery_time: None,
+            last_discovery_status: None,
+            devices_discovered: 0,
+        }));
+
         let mut mgr = Manager {
             bulbs,
             last_discovery: Instant::now(),
             sock,
             source,
+            discovery_metrics,
         };
         mgr.discover()?;
         Ok(mgr)
@@ -577,30 +599,42 @@ impl Manager {
 
     fn handle_message(raw: RawMessage, bulb: &mut BulbInfo) -> Result<(), lifx_rs::lan::Error> {
         match Message::from_raw(&raw)? {
-            Message::StateService { port: _, service: _ } => {
+            Message::StateService {
+                port: _,
+                service: _,
+            } => {
                 // if port != bulb.addr.port() as u32 || service != Service::UDP {
                 //     debug!("Unsupported service: {:?}/{}", service, port);
                 // }
             }
             Message::StateLabel { label } => {
                 bulb.name.update(label.0);
-                bulb.label = bulb.name.data.as_ref().map(|s| s.to_string()).unwrap_or_else(|| String::from("unknown"));
+                bulb.label = bulb
+                    .name
+                    .data
+                    .as_ref()
+                    .map(|s| s.to_string())
+                    .unwrap_or_else(|| String::from("unknown"));
+            }
 
-            },
-
-  
-            Message::StateLocation { location, label, updated_at: _ } => {
-
+            Message::StateLocation {
+                location,
+                label,
+                updated_at: _,
+            } => {
                 let lab = label.0;
 
                 bulb.location.update(lab.clone());
 
-
-          
-                let group_two = LifxLocation{id: format!("{:?}", location.0).replace(", ", "").replace("[", "").replace("]", ""), name: lab};
+                let group_two = LifxLocation {
+                    id: format!("{:?}", location.0)
+                        .replace(", ", "")
+                        .replace("[", "")
+                        .replace("]", ""),
+                    name: lab,
+                };
                 bulb.lifx_location = Some(group_two);
-
-            },
+            }
             Message::StateVersion {
                 vendor, product, ..
             } => {
@@ -634,20 +668,28 @@ impl Manager {
                 } else {
                     bulb.power = format!("off");
                 }
+            }
 
-               
-            },
+            Message::StateGroup {
+                group,
+                label,
+                updated_at: _,
+            } => {
+                let group_one = LifxGroup {
+                    id: format!("{:?}", group.0),
+                    name: label.to_string(),
+                };
 
-            Message::StateGroup { group, label, updated_at: _ } => {
-
-                let group_one = LifxGroup{id: format!("{:?}", group.0), name: label.to_string()};
-                
-                let group_two = LifxGroup{id: format!("{:?}", group.0).replace(", ", "").replace("[", "").replace("]", ""), name: label.to_string()};
+                let group_two = LifxGroup {
+                    id: format!("{:?}", group.0)
+                        .replace(", ", "")
+                        .replace("[", "")
+                        .replace("]", ""),
+                    name: label.to_string(),
+                };
                 bulb.group.update(group_one);
                 bulb.lifx_group = Some(group_two);
-            },
-
-
+            }
 
             Message::StateHostFirmware { version, .. } => bulb.host_firmware.update(version),
             Message::StateWifiFirmware { version, .. } => bulb.wifi_firmware.update(version),
@@ -662,8 +704,7 @@ impl Manager {
 
                     let bc = color;
 
-
-                    bulb.lifx_color = Some(LifxColor{
+                    bulb.lifx_color = Some(LifxColor {
                         hue: bc.hue,
                         saturation: bc.saturation,
                         kelvin: bc.kelvin,
@@ -671,7 +712,6 @@ impl Manager {
                     });
 
                     bulb.brightness = (bc.brightness as f32 / LIFX_BRIGHTNESS_MAX) as f64;
-
 
                     bulb.power_level.update(power);
                 }
@@ -738,13 +778,13 @@ impl Manager {
         let max_consecutive_errors: u32 = 10;
         let base_delay = Duration::from_millis(100);
         let max_delay = Duration::from_secs(30);
-        
+
         loop {
             match recv_sock.recv_from(&mut buf) {
                 Ok((0, addr)) => {
                     warn!("Received a zero-byte datagram from {:?}", addr);
                     consecutive_errors = 0;
-                },
+                }
                 Ok((nbytes, addr)) => {
                     consecutive_errors = 0;
                     match RawMessage::unpack(&buf[0..nbytes]) {
@@ -766,26 +806,27 @@ impl Manager {
                         }
                         Err(e) => error!("Error unpacking raw message from {}: {}", addr, e),
                     }
-                },
+                }
                 Err(e) => {
                     consecutive_errors += 1;
-                    error!("Network error in recv_from (attempt {}/{}): {:?}", 
-                             consecutive_errors, max_consecutive_errors, e);
-                    
+                    error!(
+                        "Network error in recv_from (attempt {}/{}): {:?}",
+                        consecutive_errors, max_consecutive_errors, e
+                    );
+
                     if consecutive_errors >= max_consecutive_errors {
                         error!("CRITICAL: Too many consecutive network errors. Resetting error counter and continuing with maximum backoff.");
                         consecutive_errors = 0;
                         thread::sleep(max_delay);
                     } else {
-                        let backoff_multiplier = 2_u32.saturating_pow(consecutive_errors.saturating_sub(1) as u32);
-                        let delay = base_delay
-                            .saturating_mul(backoff_multiplier)
-                            .min(max_delay);
-                        
+                        let backoff_multiplier =
+                            2_u32.saturating_pow(consecutive_errors.saturating_sub(1) as u32);
+                        let delay = base_delay.saturating_mul(backoff_multiplier).min(max_delay);
+
                         warn!("Retrying after {:?} delay...", delay);
                         thread::sleep(delay);
                     }
-                    
+
                     match e.kind() {
                         std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut => {
                             continue;
@@ -794,12 +835,16 @@ impl Manager {
                             warn!("Network operation interrupted, retrying immediately...");
                             continue;
                         }
-                        std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::ConnectionAborted => {
+                        std::io::ErrorKind::ConnectionReset
+                        | std::io::ErrorKind::ConnectionAborted => {
                             warn!("Connection lost, attempting to recover...");
                             continue;
                         }
                         _ => {
-                            warn!("Unexpected network error type: {:?}, continuing anyway...", e.kind());
+                            warn!(
+                                "Unexpected network error type: {:?}, continuing anyway...",
+                                e.kind()
+                            );
                             continue;
                         }
                     }
@@ -811,17 +856,34 @@ impl Manager {
     fn discover(&mut self) -> Result<(), failure::Error> {
         info!("Doing discovery");
 
+        // Update metrics for discovery attempt
+        if let Ok(mut metrics) = self.discovery_metrics.lock() {
+            metrics.total_discoveries += 1;
+        }
+
         let opts = BuildOptions {
             source: self.source,
             ..Default::default()
         };
-        let rawmsg = RawMessage::build(&opts, Message::GetService)
-            .map_err(|e| lifx_rs::lan::Error::Io(std::io::Error::new(std::io::ErrorKind::Other, format!("Failed to build message: {:?}", e))))?;
-        let bytes = rawmsg.pack()
-            .map_err(|e| lifx_rs::lan::Error::Io(std::io::Error::new(std::io::ErrorKind::Other, format!("Failed to pack message: {:?}", e))))?;
+        let rawmsg = RawMessage::build(&opts, Message::GetService).map_err(|e| {
+            lifx_rs::lan::Error::Io(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                format!("Failed to build message: {:?}", e),
+            ))
+        })?;
+        let bytes = rawmsg.pack().map_err(|e| {
+            lifx_rs::lan::Error::Io(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                format!("Failed to pack message: {:?}", e),
+            ))
+        })?;
 
-        for addr in get_if_addrs()
-            .map_err(|e| lifx_rs::lan::Error::Io(std::io::Error::new(std::io::ErrorKind::Other, format!("Failed to get network interfaces: {:?}", e))))? {
+        for addr in get_if_addrs().map_err(|e| {
+            lifx_rs::lan::Error::Io(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                format!("Failed to get network interfaces: {:?}", e),
+            ))
+        })? {
             match addr.addr {
                 IfAddr::V4(Ifv4Addr {
                     broadcast: Some(bcast),
@@ -840,15 +902,26 @@ impl Manager {
 
         self.last_discovery = Instant::now();
 
+        // Update metrics for successful discovery
+        if let Ok(mut metrics) = self.discovery_metrics.lock() {
+            metrics.successful_discoveries += 1;
+            metrics.last_discovery_time = Some(chrono::Utc::now().to_rfc3339());
+            metrics.last_discovery_status = Some("success".to_string());
+
+            // Update device count
+            if let Ok(bulbs) = self.bulbs.lock() {
+                metrics.devices_discovered = bulbs.len();
+            }
+        }
+
         Ok(())
     }
 
     fn refresh(&self) {
         if let Ok(bulbs) = self.bulbs.lock() {
             for bulb in bulbs.values() {
-                match bulb.query_for_missing_info(&self.sock){
-                    Ok(_missing_info) => {
-                    },
+                match bulb.query_for_missing_info(&self.sock) {
+                    Ok(_missing_info) => {}
                     Err(e) => {
                         error!("Error querying for missing info: {:?}", e);
                     }
@@ -864,21 +937,20 @@ impl Manager {
 pub struct Config {
     pub secret_key: String,
     pub port: u16,
+    pub discovery_refresh_interval: u64, // in seconds
+    pub auto_discovery_enabled: bool,
 }
 
 pub fn start(config: Config) {
-
-
     if let Err(e) = sudo::with_env(&["SECRET_KEY"]) {
         error!("Failed to preserve SECRET_KEY environment variable: {}", e);
         std::process::exit(1);
     }
-    
+
     if let Err(e) = sudo::escalate_if_needed() {
         error!("Failed to escalate privileges: {}", e);
         std::process::exit(1);
     }
-
 
     let mgr = Manager::new();
 
@@ -888,8 +960,11 @@ pub fn start(config: Config) {
 
             let th_arc_mgr = Arc::clone(&mgr_arc);
 
+            let discovery_refresh_interval = config.discovery_refresh_interval;
+            let auto_discovery_enabled = config.auto_discovery_enabled;
+
             thread::spawn(move || {
-                loop{
+                loop {
                     let mut lock = match th_arc_mgr.lock() {
                         Ok(l) => l,
                         Err(e) => {
@@ -898,738 +973,849 @@ pub fn start(config: Config) {
                             continue;
                         }
                     };
-                    let mgr = &mut *lock;  
-                
-                    // if Instant::now() - mgr.last_discovery > Duration::from_secs(300) {
-                    //     mgr.discover().unwrap();
-                    // }
-            
+                    let mgr = &mut *lock;
+
+                    // Auto-discovery refresh with configurable interval
+                    if auto_discovery_enabled
+                        && Instant::now() - mgr.last_discovery
+                            > Duration::from_secs(discovery_refresh_interval)
+                    {
+                        match mgr.discover() {
+                            Ok(()) => {
+                                info!("Device discovery refreshed successfully");
+                            }
+                            Err(e) => {
+                                error!(
+                                    "Discovery refresh failed: {}. Continuing without disruption.",
+                                    e
+                                );
+                                // Update failure metrics
+                                if let Ok(mut metrics) = mgr.discovery_metrics.lock() {
+                                    metrics.failed_discoveries += 1;
+                                    metrics.last_discovery_time =
+                                        Some(chrono::Utc::now().to_rfc3339());
+                                    metrics.last_discovery_status = Some(format!("failed: {}", e));
+                                }
+                                // Continue operation without crashing - discovery will be retried next interval
+                            }
+                        }
+                    }
+
                     mgr.refresh();
                     thread::sleep(Duration::from_millis(1000));
                 }
-        
             });
-        
-        
+
             let th2_arc_mgr = Arc::clone(&mgr_arc);
-            
+
             // Initialize rate limiter
             let rate_limiter = Arc::new(RateLimiter::new());
-            
+
             // Initialize scenes handler
             let scenes_handler = Arc::new(ScenesHandler::new());
-            
+
             // Spawn cleanup thread for rate limiter
             let cleanup_limiter = Arc::clone(&rate_limiter);
-            thread::spawn(move || {
-                loop {
-                    thread::sleep(Duration::from_secs(120));
-                    cleanup_limiter.cleanup_old_entries();
-                }
+            thread::spawn(move || loop {
+                thread::sleep(Duration::from_secs(120));
+                cleanup_limiter.cleanup_old_entries();
             });
-        
+
             thread::spawn(move || {
                 let scenes_handler = scenes_handler.clone();
-                rouille::start_server(format!("0.0.0.0:{}", config.port).as_str(), move |request| {
-        
-                    // Use centralized authentication middleware
-                    match authenticate_request(request, &config.secret_key, &rate_limiter) {
-                        AuthResult::Unauthorized(response) => return response,
-                        AuthResult::Authorized => {
-                            // Continue with request processing
-                        }
-                    }
-        
-        
-        
-        
-                    let mut response = Response::text("hello world");
-        
-                    let mut lock = match th2_arc_mgr.lock() {
-                        Ok(l) => l,
-                        Err(e) => {
-                            error!("Failed to acquire lock: {}", e);
-                            return Response::text("Internal Server Error").with_status_code(500);
-                        }
-                    };
-                    let mgr = &mut *lock;  
-        
-                
-                    mgr.refresh();
-        
-        
-                    let urls = request.url().to_string();
-                    let split = urls.split("/");
-                    let vec: Vec<&str> = split.collect();
-        
-                    let mut selector = "";
-        
-                    if vec.len() >= 3 {
-                        selector = vec[3];
-                    }
-            
-        
-        
-                    // Scenes API endpoints (handle before selector-based endpoints)
-                    // GET /v1/scenes
-                    if request.url() == "/v1/scenes" && request.method() == "GET" {
-                        let scenes_response = scenes_handler.list_scenes();
-                        return Response::json(&scenes_response);
-                    }
-                    
-                    // POST /v1/scenes
-                    if request.url() == "/v1/scenes" && request.method() == "POST" {
-                        let body = try_or_400!(rouille::input::plain_text_body(request));
-                        let input: CreateSceneRequest = try_or_400!(serde_json::from_str(&body));
-                        
-                        let scene_response = scenes_handler.create_scene(input);
-                        return Response::json(&scene_response);
-                    }
-                    
-                    // PUT /v1/scenes/:uuid/activate
-                    if request.url().contains("/scenes/") && request.url().contains("/activate") && request.method() == "PUT" {
-                        let url_string = request.url().to_string();
-                        let url_parts: Vec<&str> = url_string.split('/').collect();
-                        if url_parts.len() >= 4 {
-                            let uuid = url_parts[3];
-                            let body = try_or_400!(rouille::input::plain_text_body(request));
-                            let input: ActivateSceneRequest = if body.is_empty() {
-                                ActivateSceneRequest { duration: None, fast: None }
-                            } else {
-                                try_or_400!(serde_json::from_str(&body))
-                            };
-                            
-                            match scenes_handler.activate_scene(mgr, uuid, input) {
-                                Ok(activate_response) => return Response::json(&activate_response),
-                                Err(e) => return Response::text(json!({ "error": e }).to_string()).with_status_code(404),
+                rouille::start_server(
+                    format!("0.0.0.0:{}", config.port).as_str(),
+                    move |request| {
+                        // Use centralized authentication middleware
+                        match authenticate_request(request, &config.secret_key, &rate_limiter) {
+                            AuthResult::Unauthorized(response) => return response,
+                            AuthResult::Authorized => {
+                                // Continue with request processing
                             }
                         }
-                    }
-                    
-                    // DELETE /v1/scenes/:uuid
-                    if request.url().contains("/scenes/") && request.method() == "DELETE" {
-                        let url_string = request.url().to_string();
-                        let url_parts: Vec<&str> = url_string.split('/').collect();
-                        if url_parts.len() >= 4 {
-                            let uuid = url_parts[3];
-                            if scenes_handler.delete_scene(uuid) {
-                                return Response::text(json!({ "status": "deleted" }).to_string());
-                            } else {
-                                return Response::text(json!({ "error": "Scene not found" }).to_string()).with_status_code(404);
-                            }
-                        }
-                    }
-                    
-                    // POST /v1/scenes/capture
-                    if request.url() == "/v1/scenes/capture" && request.method() == "POST" {
-                        let body = try_or_400!(rouille::input::plain_text_body(request));
-                        let input: serde_json::Value = try_or_400!(serde_json::from_str(&body));
-                        let name = input.get("name")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("Captured Scene")
-                            .to_string();
-                        
-                        let scene_response = scenes_handler.capture_current_state(mgr, name);
-                        return Response::json(&scene_response);
-                    }
-                    
-                    // (PUT) SetStates
-                    // https://api.lifx.com/v1/lights/states
-                    if request.url().contains("/lights/states") && request.method() == "PUT" {
-                        let body = try_or_400!(rouille::input::plain_text_body(request));
-                        let input: StatesRequest = try_or_400!(serde_json::from_str(&body));
-                        
-                        let handler = SetStatesHandler::new();
-                        let states_response = handler.handle_request(mgr, input);
-                        response = Response::json(&states_response);
-                    } else {
-                        // For other endpoints, we need bulbs_vec
-                        let mut bulbs_vec: Vec<&BulbInfo> = Vec::new();
-        
-                        let bulbs = match mgr.bulbs.lock() {
-                            Ok(guard) => guard,
+
+                        let mut response = Response::text("hello world");
+
+                        let mut lock = match th2_arc_mgr.lock() {
+                            Ok(l) => l,
                             Err(e) => {
-                                eprintln!("Failed to acquire bulbs lock: {}", e);
-                                return Response::text("Internal Server Error").with_status_code(500);
+                                error!("Failed to acquire lock: {}", e);
+                                return Response::text("Internal Server Error")
+                                    .with_status_code(500);
                             }
                         };
-                        
-                            
-                        for bulb in bulbs.values() {
-                            bulbs_vec.push(bulb);
-                        }
-        
-                        if selector == "all"{
-                        
-                        }
-        
-                        if selector.contains("group_id:"){
-                            bulbs_vec = bulbs_vec
-                            .into_iter()
-                            .filter(|b| b.lifx_group.as_ref().map_or(false, |g| g.id.contains(&selector.replace("group_id:", ""))))
-                            .collect();
-                        }
-        
-                        if selector.contains("location_id:"){
-                            bulbs_vec = bulbs_vec
-                            .into_iter()
-                            .filter(|b| b.lifx_location.as_ref().map_or(false, |l| l.id.contains(&selector.replace("location_id:", ""))))
-                            .collect();
-                        }
-        
-                        if selector.contains("id:"){
-                            bulbs_vec = bulbs_vec
-                            .into_iter()
-                            .filter(|b| b.id.contains(&selector.replace("id:", "")))
-                            .collect();
-                        }
-        
-                    // (PUT) SetState
-                    // https://api.lifx.com/v1/lights/:selector/state
-                    if request.url().contains("/state"){
-        
-                        let input = try_or_400!(post_input!(request, {
-                            power: Option<String>,
-                            color: Option<String>,
-                            brightness: Option<f64>,
-                            duration: Option<f64>,
-                            infrared: Option<f64>,
-                            fast: Option<bool>
-                        }));
-        
-        
-                        // Power
-                        if input.power.is_some() {
-                            let power = match input.power {
-                                Some(p) => p,
-                                None => {
-                                    return Response::text(json!({
-                                        "error": "Missing power value"
-                                    }).to_string()).with_status_code(400);
-                                }
-                            };
-                            if power == format!("on"){
-                                for bulb in &bulbs_vec {
-                                    bulb.set_power(&mgr.sock, PowerLevel::Enabled);
-                                }
-                            } 
-                
-                            if power == format!("off"){
-                                for bulb in &bulbs_vec {
-                                    bulb.set_power(&mgr.sock, PowerLevel::Standby);
-                                }
-                            } 
-                        }
-        
-                        // Color
-                        if input.color.is_some() {
-                            let cc = match input.color {
-                                Some(c) => c,
-                                None => {
-                                    return Response::text(json!({
-                                        "error": "Missing color value"
-                                    }).to_string()).with_status_code(400);
-                                }
-                            };
-        
-        
-        
-                            for bulb in &bulbs_vec {
-        
-        
-                                let mut kelvin = 6500;
-                                let mut brightness = LIFX_BRIGHTNESS_MAX as u16;
-                                let mut saturation = 0;
-                                let mut hue = 0;
-        
-                                let mut duration = 0;
-                                if input.duration.is_some(){
-                                    duration = input.duration.unwrap_or(0.0) as u32;
-                                }
-        
-                                if let Some(lifxc) = bulb.lifx_color.as_ref() {
-                                    kelvin = lifxc.kelvin;
-                                    brightness = lifxc.brightness;
-                                    saturation = lifxc.saturation;
-                                    hue = lifxc.hue;
-                                }
-                            
-                                if cc.contains("white"){
-                                    let hbsk_set = HSBK {
-                                        hue: HUE_RED,
-                                        saturation: 0,
-                                        brightness: brightness,
-                                        kelvin: kelvin,
-                                    };
-                                    bulb.set_color(&mgr.sock, hbsk_set, duration);
-                                }
-        
-                                if cc.contains("red"){
-                                    let hbsk_set = HSBK {
-                                        hue: HUE_RED,
-                                        saturation: LIFX_SATURATION_MAX as u16,
-                                        brightness: brightness,
-                                        kelvin: kelvin,
-                                    };
-                                    bulb.set_color(&mgr.sock, hbsk_set, duration);
-                                }
-        
-                                if cc.contains("orange"){
-                                    let hbsk_set = HSBK {
-                                        hue: HUE_ORANGE,
-                                        saturation: LIFX_SATURATION_MAX as u16,
-                                        brightness: brightness,
-                                        kelvin: kelvin,
-                                    };
-                                    bulb.set_color(&mgr.sock, hbsk_set, duration);
-                                }
-        
-                                if cc.contains("yellow"){
-                                    let hbsk_set = HSBK {
-                                        hue: HUE_YELLOW,
-                                        saturation: LIFX_SATURATION_MAX as u16,
-                                        brightness: brightness,
-                                        kelvin: kelvin,
-                                    };
-                                    bulb.set_color(&mgr.sock, hbsk_set, duration);
-                                }
-        
-                                if cc.contains("cyan"){
-                                    let hbsk_set = HSBK {
-                                        hue: HUE_CYAN,
-                                        saturation: LIFX_SATURATION_MAX as u16,
-                                        brightness: brightness,
-                                        kelvin: kelvin,
-                                    };
-                                    bulb.set_color(&mgr.sock, hbsk_set, duration);
-                                }
-        
-                                if cc.contains("green"){
-                                    let hbsk_set = HSBK {
-                                        hue: HUE_GREEN,
-                                        saturation: LIFX_SATURATION_MAX as u16,
-                                        brightness: brightness,
-                                        kelvin: kelvin,
-                                    };
-                                    bulb.set_color(&mgr.sock, hbsk_set, duration);
-                                }
-        
-                                if cc.contains("blue"){
-                                    let hbsk_set = HSBK {
-                                        hue: HUE_BLUE,
-                                        saturation: LIFX_SATURATION_MAX as u16,
-                                        brightness: brightness,
-                                        kelvin: kelvin,
-                                    };
-                                    bulb.set_color(&mgr.sock, hbsk_set, duration);
-                                }
-        
-                                if cc.contains("purple"){
-                                    let hbsk_set = HSBK {
-                                        hue: HUE_PURPLE,
-                                        saturation: LIFX_SATURATION_MAX as u16,
-                                        brightness: brightness,
-                                        kelvin: kelvin,
-                                    };
-                                    bulb.set_color(&mgr.sock, hbsk_set, duration);
-                                }
-        
-                                if cc.contains("pink"){
-                                    let hbsk_set = HSBK {
-                                        hue: HUE_PINK,
-                                        saturation: 25000,
-                                        brightness: brightness,
-                                        kelvin: kelvin,
-                                    };
-                                    bulb.set_color(&mgr.sock, hbsk_set, duration);
-                                }
-        
-        
-                                if cc.contains("hue:"){
-        
-                                    let hue_split = cc.split("hue:");
-                                    let hue_vec: Vec<&str> = hue_split.collect();
-                                    let new_hue = match parse_u16_safe(&hue_vec[1]) {
-                                        Ok(h) => h,
-                                        Err(e) => {
-                                            error!("Error parsing hue: {}", e);
-                                            continue;
-                                        }
-                                    }; 
-                                    let hbsk_set = HSBK {
-                                        hue: new_hue,
-                                        saturation: saturation,
-                                        brightness: brightness,
-                                        kelvin: kelvin,
-                                    };
-                                    bulb.set_color(&mgr.sock, hbsk_set, duration);
-                                }
-        
-                                if cc.contains("saturation:"){
-                                    let saturation_split = cc.split("saturation:");
-                                    let saturation_vec: Vec<&str> = saturation_split.collect();
-                                    let new_saturation_float = match parse_f64_safe(&saturation_vec[1]) {
-                                        Ok(s) => s,
-                                        Err(e) => {
-                                            error!("Error parsing saturation: {}", e);
-                                            continue;
-                                        }
-                                    }; 
-                                    let new_saturation: u16 = (f64::from(100) * new_saturation_float) as u16;
-                                    let hbsk_set = HSBK {
-                                        hue: hue,
-                                        saturation: new_saturation,
-                                        brightness: brightness,
-                                        kelvin: kelvin,
-                                    };
-                                    bulb.set_color(&mgr.sock, hbsk_set, duration);
-                                }
-        
-                                if cc.contains("brightness:"){
-                                    let brightness_split = cc.split("brightness:");
-                                    let brightness_vec: Vec<&str> = brightness_split.collect();
-                                    let new_brightness_float = match parse_f64_safe(&brightness_vec[1]) {
-                                        Ok(b) => b,
-                                        Err(e) => {
-                                            error!("Error parsing brightness: {}", e);
-                                            continue;
-                                        }
-                                    }; 
-                                    let new_brightness: u16 = (LIFX_BRIGHTNESS_MAX * new_brightness_float as f32) as u16;
-                                    let hbsk_set = HSBK {
-                                        hue: hue,
-                                        saturation: saturation,
-                                        brightness: new_brightness,
-                                        kelvin: kelvin,
-                                    };
-                                    bulb.set_color(&mgr.sock, hbsk_set, duration);
-                                }
-        
-                                if cc.contains("kelvin:"){
-                                    let kelvin_split = cc.split("kelvin:");
-                                    let kelvin_vec: Vec<&str> = kelvin_split.collect();
-                                    let new_kelvin = match parse_u16_safe(&kelvin_vec[1]) {
-                                        Ok(k) => k,
-                                        Err(e) => {
-                                            error!("Error parsing kelvin: {}", e);
-                                            continue;
-                                        }
-                                    }; 
-                                    let hbsk_set = HSBK {
-                                        hue: hue,
-                                        saturation: 0,
-                                        brightness: brightness,
-                                        kelvin: new_kelvin,
-                                    };
-                                    bulb.set_color(&mgr.sock, hbsk_set, duration);
-                                }
-        
-                                if cc.contains("rgb:"){
-        
-        
-                                    let rgb_split = cc.split("rgb:");
-                                    let rgb_vec: Vec<&str> = rgb_split.collect();
-                                    let rgb_parts = rgb_vec[1].to_string();
-        
-                                    let rgb_part_split = rgb_parts.split(",");
-                                    let rgb_parts_vec: Vec<&str> = rgb_part_split.collect();
-        
-                                    let red_int = match parse_i64_safe(&rgb_parts_vec[0]) {
-                                        Ok(r) => r,
-                                        Err(e) => {
-                                            error!("Error parsing red value: {}", e);
-                                            continue;
-                                        }
-                                    };
-                                    let red_float: f32 = (red_int) as f32;
-        
-                                    let green_int = match parse_i64_safe(&rgb_parts_vec[1]) {
-                                        Ok(g) => g,
-                                        Err(e) => {
-                                            error!("Error parsing green value: {}", e);
-                                            continue;
-                                        }
-                                    };
-                                    let green_float: f32 = (green_int) as f32;
-        
-                                    let blue_int = match parse_i64_safe(&rgb_parts_vec[2]) {
-                                        Ok(b) => b,
-                                        Err(e) => {
-                                            error!("Error parsing blue value: {}", e);
-                                            continue;
-                                        }
-                                    };
-                                    let blue_float: f32 = (blue_int) as f32;
-        
-                                    let rgb = Srgb::new(red_float / 255.0, green_float / 255.0, blue_float / 255.0);
-                                    let hcc: Hsv = rgb.into_color();
-        
-                                    // Convert HSV to LIFX HSBK format (16-bit values)
-                                    let hbsk_set = HSBK {
-                                        hue: ((hcc.hue.into_positive_degrees() * LIFX_HUE_DEGREE_FACTOR) as u32 % 0x10000) as u16,
-                                        saturation: (hcc.saturation * LIFX_SATURATION_MAX) as u16,
-                                        brightness: brightness,
-                                        kelvin: kelvin,
-                                    };
+                        let mgr = &mut *lock;
 
-        
-                                    bulb.set_color(&mgr.sock, hbsk_set, duration);
-        
-                                }
-        
-                                if cc.contains("#"){
-                                    debug!("Processing color conversion");
-                                    let hex_split = cc.split("#");
-                                    let hex_vec: Vec<&str> = hex_split.collect();
-                                    let hex = hex_vec[1].to_string();
-        
-                                    let rgb2 = match Rgb::from_hex_str(format!("#{}", hex).as_str()) {
-                                        Ok(rgb) => rgb,
-                                        Err(_) => {
-                                            error!("Error parsing hex color: {}", hex);
-                                            continue;
-                                        }
-                                    };
-                                    // Rgb { r: 255.0, g: 204.0, b: 0.0 }
-        
-                                    debug!("RGB values: {:?}", rgb2);
-        
-                                    let red_int = match parse_i64_safe(&rgb2.get_red().to_string()) {
-                                        Ok(r) => r,
-                                        Err(e) => {
-                                            error!("Error parsing red from hex: {}", e);
-                                            continue;
-                                        }
-                                    };
-                                    let red_float: f32 = (red_int) as f32;
-        
-                                    let green_int = match parse_i64_safe(&rgb2.get_green().to_string()) {
-                                        Ok(g) => g,
-                                        Err(e) => {
-                                            error!("Error parsing green from hex: {}", e);
-                                            continue;
-                                        }
-                                    };
-                                    let green_float: f32 = (green_int) as f32;
-        
-                                    let blue_int = match parse_i64_safe(&rgb2.get_blue().to_string()) {
-                                        Ok(b) => b,
-                                        Err(e) => {
-                                            error!("Error parsing blue from hex: {}", e);
-                                            continue;
-                                        }
-                                    };
-                                    let blue_float: f32 = (blue_int) as f32;
-        
-        
-                                    debug!("red_float: {:?}", red_float);
-                                    debug!("green_float: {:?}", green_float);
-                                    debug!("blue_float: {:?}", blue_float);
-        
-                    
-                                    let rgb = Srgb::new(red_float / 255.0, green_float / 255.0, blue_float / 255.0);
-                                    let hcc: Hsv = rgb.into_color();
+                        mgr.refresh();
 
-                                    debug!("HSV values: {:?}", hcc);
-        
-                                    // Convert HSV to LIFX HSBK format (16-bit values)
-                                    let hbsk_set = HSBK {
-                                        hue: ((hcc.hue.into_positive_degrees() * LIFX_HUE_DEGREE_FACTOR) as u32 % 0x10000) as u16,
-                                        saturation: (hcc.saturation * LIFX_SATURATION_MAX) as u16,
-                                        brightness: brightness,
-                                        kelvin: kelvin,
-                                    };
+                        let urls = request.url().to_string();
+                        let split = urls.split("/");
+                        let vec: Vec<&str> = split.collect();
 
-                                    debug!("HBSK values: {:?}", hbsk_set);
-        
-        
-        
-                                    bulb.set_color(&mgr.sock, hbsk_set, duration);
-        
-                                }
-        
-                            }
+                        let mut selector = "";
+
+                        if vec.len() >= 3 {
+                            selector = vec[3];
                         }
-        
-        
-                        // Brightness
-                        if input.brightness.is_some() {
-                            let brightness = match input.brightness {
-                                Some(b) => b,
-                                None => {
-                                    return Response::text(json!({
-                                        "error": "Missing brightness value"
-                                    }).to_string()).with_status_code(400);
-                                }
-                            };
-        
-                            for bulb in &bulbs_vec {
-        
-        
-                                let mut kelvin = 6500;
-                                let mut saturation = 0;
-                                let mut hue = 0;
-        
-                                let mut duration = 0;
-                                if input.duration.is_some(){
-                                    duration = input.duration.unwrap_or(0.0) as u32;
-                                }
-        
-                                if bulb.lifx_color.is_some() {
-                                    let lifxc = bulb.lifx_color.as_ref().unwrap();
-                                    kelvin = lifxc.kelvin;
-                                    saturation = lifxc.saturation;
-                                    hue = lifxc.hue;
-                                }
-                                
-                                let new_brightness_float = match parse_f64_safe(&brightness.to_string()) {
-                                    Ok(b) => b,
-                                    Err(e) => {
-                                        error!("Error parsing brightness: {}", e);
-                                        continue;
+
+                        // Scenes API endpoints (handle before selector-based endpoints)
+                        // GET /v1/scenes
+                        if request.url() == "/v1/scenes" && request.method() == "GET" {
+                            let scenes_response = scenes_handler.list_scenes();
+                            return Response::json(&scenes_response);
+                        }
+
+                        // POST /v1/scenes
+                        if request.url() == "/v1/scenes" && request.method() == "POST" {
+                            let body = try_or_400!(rouille::input::plain_text_body(request));
+                            let input: CreateSceneRequest =
+                                try_or_400!(serde_json::from_str(&body));
+
+                            let scene_response = scenes_handler.create_scene(input);
+                            return Response::json(&scene_response);
+                        }
+
+                        // PUT /v1/scenes/:uuid/activate
+                        if request.url().contains("/scenes/")
+                            && request.url().contains("/activate")
+                            && request.method() == "PUT"
+                        {
+                            let url_string = request.url().to_string();
+                            let url_parts: Vec<&str> = url_string.split('/').collect();
+                            if url_parts.len() >= 4 {
+                                let uuid = url_parts[3];
+                                let body = try_or_400!(rouille::input::plain_text_body(request));
+                                let input: ActivateSceneRequest = if body.is_empty() {
+                                    ActivateSceneRequest {
+                                        duration: None,
+                                        fast: None,
                                     }
-                                }; 
-                                let new_brightness: u16 = (LIFX_BRIGHTNESS_MAX * new_brightness_float as f32) as u16;
-                                let hbsk_set = HSBK {
-                                    hue: hue,
-                                    saturation: saturation,
-                                    brightness: new_brightness,
-                                    kelvin: kelvin,
+                                } else {
+                                    try_or_400!(serde_json::from_str(&body))
                                 };
-                                bulb.set_color(&mgr.sock, hbsk_set, duration);
-        
+
+                                match scenes_handler.activate_scene(mgr, uuid, input) {
+                                    Ok(activate_response) => {
+                                        return Response::json(&activate_response)
+                                    }
+                                    Err(e) => {
+                                        return Response::text(json!({ "error": e }).to_string())
+                                            .with_status_code(404)
+                                    }
+                                }
                             }
-        
                         }
-        
-                        // Infrared
-                        if input.infrared.is_some() {
-                            let infrared_val = match input.infrared {
-                                Some(i) => i,
-                                None => {
-                                    return Response::text(json!({
-                                        "error": "Missing infrared value"
-                                    }).to_string()).with_status_code(400);
+
+                        // DELETE /v1/scenes/:uuid
+                        if request.url().contains("/scenes/") && request.method() == "DELETE" {
+                            let url_string = request.url().to_string();
+                            let url_parts: Vec<&str> = url_string.split('/').collect();
+                            if url_parts.len() >= 4 {
+                                let uuid = url_parts[3];
+                                if scenes_handler.delete_scene(uuid) {
+                                    return Response::text(
+                                        json!({ "status": "deleted" }).to_string(),
+                                    );
+                                } else {
+                                    return Response::text(
+                                        json!({ "error": "Scene not found" }).to_string(),
+                                    )
+                                    .with_status_code(404);
+                                }
+                            }
+                        }
+
+                        // POST /v1/scenes/capture
+                        if request.url() == "/v1/scenes/capture" && request.method() == "POST" {
+                            let body = try_or_400!(rouille::input::plain_text_body(request));
+                            let input: serde_json::Value = try_or_400!(serde_json::from_str(&body));
+                            let name = input
+                                .get("name")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("Captured Scene")
+                                .to_string();
+
+                            let scene_response = scenes_handler.capture_current_state(mgr, name);
+                            return Response::json(&scene_response);
+                        }
+
+                        // POST /v1/discover - Manual device discovery endpoint
+                        if request.url() == "/v1/discover" && request.method() == "POST" {
+                            info!("Manual device discovery requested");
+                            match mgr.discover() {
+                                Ok(()) => {
+                                    info!("Manual discovery completed successfully");
+                                    return Response::json(&json!({
+                                        "status": "success",
+                                        "message": "Device discovery completed successfully"
+                                    }));
+                                }
+                                Err(e) => {
+                                    error!("Manual discovery failed: {}", e);
+                                    // Update failure metrics for manual discovery
+                                    if let Ok(mut metrics) = mgr.discovery_metrics.lock() {
+                                        metrics.failed_discoveries += 1;
+                                        metrics.last_discovery_time =
+                                            Some(chrono::Utc::now().to_rfc3339());
+                                        metrics.last_discovery_status =
+                                            Some(format!("failed: {}", e));
+                                    }
+                                    return Response::json(&json!({
+                                        "status": "error",
+                                        "message": format!("Discovery failed: {}", e)
+                                    }))
+                                    .with_status_code(500);
+                                }
+                            }
+                        }
+
+                        // GET /v1/discover/metrics - Get discovery metrics
+                        if request.url() == "/v1/discover/metrics" && request.method() == "GET" {
+                            if let Ok(metrics) = mgr.discovery_metrics.lock() {
+                                let metrics_clone = metrics.clone();
+                                return Response::json(&metrics_clone);
+                            } else {
+                                return Response::json(&json!({
+                                    "error": "Failed to retrieve metrics"
+                                }))
+                                .with_status_code(500);
+                            }
+                        }
+
+                        // (PUT) SetStates
+                        // https://api.lifx.com/v1/lights/states
+                        if request.url().contains("/lights/states") && request.method() == "PUT" {
+                            let body = try_or_400!(rouille::input::plain_text_body(request));
+                            let input: StatesRequest = try_or_400!(serde_json::from_str(&body));
+
+                            let handler = SetStatesHandler::new();
+                            let states_response = handler.handle_request(mgr, input);
+                            response = Response::json(&states_response);
+                        } else {
+                            // For other endpoints, we need bulbs_vec
+                            let mut bulbs_vec: Vec<&BulbInfo> = Vec::new();
+
+                            let bulbs = match mgr.bulbs.lock() {
+                                Ok(guard) => guard,
+                                Err(e) => {
+                                    eprintln!("Failed to acquire bulbs lock: {}", e);
+                                    return Response::text("Internal Server Error")
+                                        .with_status_code(500);
                                 }
                             };
-                            let new_brightness: u16 = (LIFX_BRIGHTNESS_MAX * infrared_val as f32) as u16;
-        
-                            for bulb in &bulbs_vec {
-                                bulb.set_infrared(&mgr.sock, new_brightness);
+
+                            for bulb in bulbs.values() {
+                                bulbs_vec.push(bulb);
                             }
-                        }
-        
-        
-                        // Return results in proper format
-                        #[derive(Serialize)]
-                        struct SingleStateResult {
-                            id: String,
-                            label: String,
-                            status: String,
-                        }
 
-                        #[derive(Serialize)]
-                        struct SingleStateResponse {
-                            results: Vec<SingleStateResult>,
-                        }
+                            if selector == "all" {}
 
-                        let mut results = Vec::new();
-                        for bulb in &bulbs_vec {
-                            results.push(SingleStateResult {
-                                id: bulb.id.clone(),
-                                label: bulb.label.clone(),
-                                status: "ok".to_string(),
-                            });
-                        }
+                            if selector.contains("group_id:") {
+                                bulbs_vec = bulbs_vec
+                                    .into_iter()
+                                    .filter(|b| {
+                                        b.lifx_group.as_ref().map_or(false, |g| {
+                                            g.id.contains(&selector.replace("group_id:", ""))
+                                        })
+                                    })
+                                    .collect();
+                            }
 
-                        response = Response::json(&SingleStateResponse { results });
-        
-                    }
-        
-        
-                        // ListLights
-                        // https://api.lifx.com/v1/lights/:selector
-                        if request.url().contains("/v1/lights/") && !request.url().contains("/state") && !request.url().contains("/effects") && !request.url().contains("/cycle") && !request.url().contains("/clean"){
-                            response = Response::json(&bulbs_vec.clone());
-                        }
-                        
-                        // Effects API endpoints
-                        // POST /v1/lights/:selector/effects/pulse
-                        if request.url().contains("/effects/pulse") && request.method() == "POST" {
-                            let body = try_or_400!(rouille::input::plain_text_body(request));
-                            let input: EffectRequest = try_or_400!(serde_json::from_str(&body));
-                            
-                            let handler = EffectsHandler::new();
-                            let effects_response = handler.handle_pulse(mgr, &bulbs_vec, input);
-                            response = Response::json(&effects_response);
-                        }
-                        
-                        // POST /v1/lights/:selector/effects/breathe
-                        if request.url().contains("/effects/breathe") && request.method() == "POST" {
-                            let body = try_or_400!(rouille::input::plain_text_body(request));
-                            let input: EffectRequest = try_or_400!(serde_json::from_str(&body));
-                            
-                            let handler = EffectsHandler::new();
-                            let effects_response = handler.handle_breathe(mgr, &bulbs_vec, input);
-                            response = Response::json(&effects_response);
-                        }
-                        
-                        // POST /v1/lights/:selector/effects/strobe
-                        if request.url().contains("/effects/strobe") && request.method() == "POST" {
-                            let body = try_or_400!(rouille::input::plain_text_body(request));
-                            let input: EffectRequest = try_or_400!(serde_json::from_str(&body));
-                            
-                            let handler = EffectsHandler::new();
-                            let effects_response = handler.handle_strobe(mgr, &bulbs_vec, input);
-                            response = Response::json(&effects_response);
-                        }
-                        
-                        // Cycle API endpoint
-                        // POST /v1/lights/:selector/cycle
-                        if request.url().contains("/cycle") && request.method() == "POST" {
-                            let body = try_or_400!(rouille::input::plain_text_body(request));
-                            let input: CycleRequest = try_or_400!(serde_json::from_str(&body));
-                            
-                            let handler = CycleHandler::new();
-                            let cycle_response = handler.handle_cycle(mgr, &bulbs_vec, input);
-                            response = Response::json(&cycle_response);
-                        }
-                        
-                        // Clean API endpoint
-                        // POST /v1/lights/:selector/clean
-                        if request.url().contains("/clean") && request.method() == "POST" {
-                            let body = try_or_400!(rouille::input::plain_text_body(request));
-                            let input: CleanRequest = try_or_400!(serde_json::from_str(&body));
-                            
-                            let handler = CleanHandler::new();
-                            let clean_response = handler.handle_clean(mgr, &bulbs_vec, input);
-                            response = Response::json(&clean_response);
-                        }
-                    } // Close the else block here
-        
-        
-                    // Mutex locks will be automatically dropped when they go out of scope
-        
-                    return response;
-                });
+                            if selector.contains("location_id:") {
+                                bulbs_vec = bulbs_vec
+                                    .into_iter()
+                                    .filter(|b| {
+                                        b.lifx_location.as_ref().map_or(false, |l| {
+                                            l.id.contains(&selector.replace("location_id:", ""))
+                                        })
+                                    })
+                                    .collect();
+                            }
+
+                            if selector.contains("id:") {
+                                bulbs_vec = bulbs_vec
+                                    .into_iter()
+                                    .filter(|b| b.id.contains(&selector.replace("id:", "")))
+                                    .collect();
+                            }
+
+                            // (PUT) SetState
+                            // https://api.lifx.com/v1/lights/:selector/state
+                            if request.url().contains("/state") {
+                                let input = try_or_400!(post_input!(request, {
+                                    power: Option<String>,
+                                    color: Option<String>,
+                                    brightness: Option<f64>,
+                                    duration: Option<f64>,
+                                    infrared: Option<f64>,
+                                    fast: Option<bool>
+                                }));
+
+                                // Power
+                                if input.power.is_some() {
+                                    let power = match input.power {
+                                        Some(p) => p,
+                                        None => {
+                                            return Response::text(
+                                                json!({
+                                                    "error": "Missing power value"
+                                                })
+                                                .to_string(),
+                                            )
+                                            .with_status_code(400);
+                                        }
+                                    };
+                                    if power == format!("on") {
+                                        for bulb in &bulbs_vec {
+                                            bulb.set_power(&mgr.sock, PowerLevel::Enabled);
+                                        }
+                                    }
+
+                                    if power == format!("off") {
+                                        for bulb in &bulbs_vec {
+                                            bulb.set_power(&mgr.sock, PowerLevel::Standby);
+                                        }
+                                    }
+                                }
+
+                                // Color
+                                if input.color.is_some() {
+                                    let cc = match input.color {
+                                        Some(c) => c,
+                                        None => {
+                                            return Response::text(
+                                                json!({
+                                                    "error": "Missing color value"
+                                                })
+                                                .to_string(),
+                                            )
+                                            .with_status_code(400);
+                                        }
+                                    };
+
+                                    for bulb in &bulbs_vec {
+                                        let mut kelvin = 6500;
+                                        let mut brightness = LIFX_BRIGHTNESS_MAX as u16;
+                                        let mut saturation = 0;
+                                        let mut hue = 0;
+
+                                        let mut duration = 0;
+                                        if input.duration.is_some() {
+                                            duration = input.duration.unwrap_or(0.0) as u32;
+                                        }
+
+                                        if let Some(lifxc) = bulb.lifx_color.as_ref() {
+                                            kelvin = lifxc.kelvin;
+                                            brightness = lifxc.brightness;
+                                            saturation = lifxc.saturation;
+                                            hue = lifxc.hue;
+                                        }
+
+                                        if cc.contains("white") {
+                                            let hbsk_set = HSBK {
+                                                hue: HUE_RED,
+                                                saturation: 0,
+                                                brightness: brightness,
+                                                kelvin: kelvin,
+                                            };
+                                            bulb.set_color(&mgr.sock, hbsk_set, duration);
+                                        }
+
+                                        if cc.contains("red") {
+                                            let hbsk_set = HSBK {
+                                                hue: HUE_RED,
+                                                saturation: LIFX_SATURATION_MAX as u16,
+                                                brightness: brightness,
+                                                kelvin: kelvin,
+                                            };
+                                            bulb.set_color(&mgr.sock, hbsk_set, duration);
+                                        }
+
+                                        if cc.contains("orange") {
+                                            let hbsk_set = HSBK {
+                                                hue: HUE_ORANGE,
+                                                saturation: LIFX_SATURATION_MAX as u16,
+                                                brightness: brightness,
+                                                kelvin: kelvin,
+                                            };
+                                            bulb.set_color(&mgr.sock, hbsk_set, duration);
+                                        }
+
+                                        if cc.contains("yellow") {
+                                            let hbsk_set = HSBK {
+                                                hue: HUE_YELLOW,
+                                                saturation: LIFX_SATURATION_MAX as u16,
+                                                brightness: brightness,
+                                                kelvin: kelvin,
+                                            };
+                                            bulb.set_color(&mgr.sock, hbsk_set, duration);
+                                        }
+
+                                        if cc.contains("cyan") {
+                                            let hbsk_set = HSBK {
+                                                hue: HUE_CYAN,
+                                                saturation: LIFX_SATURATION_MAX as u16,
+                                                brightness: brightness,
+                                                kelvin: kelvin,
+                                            };
+                                            bulb.set_color(&mgr.sock, hbsk_set, duration);
+                                        }
+
+                                        if cc.contains("green") {
+                                            let hbsk_set = HSBK {
+                                                hue: HUE_GREEN,
+                                                saturation: LIFX_SATURATION_MAX as u16,
+                                                brightness: brightness,
+                                                kelvin: kelvin,
+                                            };
+                                            bulb.set_color(&mgr.sock, hbsk_set, duration);
+                                        }
+
+                                        if cc.contains("blue") {
+                                            let hbsk_set = HSBK {
+                                                hue: HUE_BLUE,
+                                                saturation: LIFX_SATURATION_MAX as u16,
+                                                brightness: brightness,
+                                                kelvin: kelvin,
+                                            };
+                                            bulb.set_color(&mgr.sock, hbsk_set, duration);
+                                        }
+
+                                        if cc.contains("purple") {
+                                            let hbsk_set = HSBK {
+                                                hue: HUE_PURPLE,
+                                                saturation: LIFX_SATURATION_MAX as u16,
+                                                brightness: brightness,
+                                                kelvin: kelvin,
+                                            };
+                                            bulb.set_color(&mgr.sock, hbsk_set, duration);
+                                        }
+
+                                        if cc.contains("pink") {
+                                            let hbsk_set = HSBK {
+                                                hue: HUE_PINK,
+                                                saturation: 25000,
+                                                brightness: brightness,
+                                                kelvin: kelvin,
+                                            };
+                                            bulb.set_color(&mgr.sock, hbsk_set, duration);
+                                        }
+
+                                        if cc.contains("hue:") {
+                                            let hue_split = cc.split("hue:");
+                                            let hue_vec: Vec<&str> = hue_split.collect();
+                                            let new_hue = match parse_u16_safe(&hue_vec[1]) {
+                                                Ok(h) => h,
+                                                Err(e) => {
+                                                    error!("Error parsing hue: {}", e);
+                                                    continue;
+                                                }
+                                            };
+                                            let hbsk_set = HSBK {
+                                                hue: new_hue,
+                                                saturation: saturation,
+                                                brightness: brightness,
+                                                kelvin: kelvin,
+                                            };
+                                            bulb.set_color(&mgr.sock, hbsk_set, duration);
+                                        }
+
+                                        if cc.contains("saturation:") {
+                                            let saturation_split = cc.split("saturation:");
+                                            let saturation_vec: Vec<&str> =
+                                                saturation_split.collect();
+                                            let new_saturation_float =
+                                                match parse_f64_safe(&saturation_vec[1]) {
+                                                    Ok(s) => s,
+                                                    Err(e) => {
+                                                        error!("Error parsing saturation: {}", e);
+                                                        continue;
+                                                    }
+                                                };
+                                            let new_saturation: u16 =
+                                                (f64::from(100) * new_saturation_float) as u16;
+                                            let hbsk_set = HSBK {
+                                                hue: hue,
+                                                saturation: new_saturation,
+                                                brightness: brightness,
+                                                kelvin: kelvin,
+                                            };
+                                            bulb.set_color(&mgr.sock, hbsk_set, duration);
+                                        }
+
+                                        if cc.contains("brightness:") {
+                                            let brightness_split = cc.split("brightness:");
+                                            let brightness_vec: Vec<&str> =
+                                                brightness_split.collect();
+                                            let new_brightness_float =
+                                                match parse_f64_safe(&brightness_vec[1]) {
+                                                    Ok(b) => b,
+                                                    Err(e) => {
+                                                        error!("Error parsing brightness: {}", e);
+                                                        continue;
+                                                    }
+                                                };
+                                            let new_brightness: u16 = (LIFX_BRIGHTNESS_MAX
+                                                * new_brightness_float as f32)
+                                                as u16;
+                                            let hbsk_set = HSBK {
+                                                hue: hue,
+                                                saturation: saturation,
+                                                brightness: new_brightness,
+                                                kelvin: kelvin,
+                                            };
+                                            bulb.set_color(&mgr.sock, hbsk_set, duration);
+                                        }
+
+                                        if cc.contains("kelvin:") {
+                                            let kelvin_split = cc.split("kelvin:");
+                                            let kelvin_vec: Vec<&str> = kelvin_split.collect();
+                                            let new_kelvin = match parse_u16_safe(&kelvin_vec[1]) {
+                                                Ok(k) => k,
+                                                Err(e) => {
+                                                    error!("Error parsing kelvin: {}", e);
+                                                    continue;
+                                                }
+                                            };
+                                            let hbsk_set = HSBK {
+                                                hue: hue,
+                                                saturation: 0,
+                                                brightness: brightness,
+                                                kelvin: new_kelvin,
+                                            };
+                                            bulb.set_color(&mgr.sock, hbsk_set, duration);
+                                        }
+
+                                        if cc.contains("rgb:") {
+                                            let rgb_split = cc.split("rgb:");
+                                            let rgb_vec: Vec<&str> = rgb_split.collect();
+                                            let rgb_parts = rgb_vec[1].to_string();
+
+                                            let rgb_part_split = rgb_parts.split(",");
+                                            let rgb_parts_vec: Vec<&str> = rgb_part_split.collect();
+
+                                            let red_int = match parse_i64_safe(&rgb_parts_vec[0]) {
+                                                Ok(r) => r,
+                                                Err(e) => {
+                                                    error!("Error parsing red value: {}", e);
+                                                    continue;
+                                                }
+                                            };
+                                            let red_float: f32 = (red_int) as f32;
+
+                                            let green_int = match parse_i64_safe(&rgb_parts_vec[1])
+                                            {
+                                                Ok(g) => g,
+                                                Err(e) => {
+                                                    error!("Error parsing green value: {}", e);
+                                                    continue;
+                                                }
+                                            };
+                                            let green_float: f32 = (green_int) as f32;
+
+                                            let blue_int = match parse_i64_safe(&rgb_parts_vec[2]) {
+                                                Ok(b) => b,
+                                                Err(e) => {
+                                                    error!("Error parsing blue value: {}", e);
+                                                    continue;
+                                                }
+                                            };
+                                            let blue_float: f32 = (blue_int) as f32;
+
+                                            let rgb = Srgb::new(
+                                                red_float / 255.0,
+                                                green_float / 255.0,
+                                                blue_float / 255.0,
+                                            );
+                                            let hcc: Hsv = rgb.into_color();
+
+                                            // Convert HSV to LIFX HSBK format (16-bit values)
+                                            let hbsk_set = HSBK {
+                                                hue: ((hcc.hue.into_positive_degrees()
+                                                    * LIFX_HUE_DEGREE_FACTOR)
+                                                    as u32
+                                                    % 0x10000)
+                                                    as u16,
+                                                saturation: (hcc.saturation * LIFX_SATURATION_MAX)
+                                                    as u16,
+                                                brightness: brightness,
+                                                kelvin: kelvin,
+                                            };
+
+                                            bulb.set_color(&mgr.sock, hbsk_set, duration);
+                                        }
+
+                                        if cc.contains("#") {
+                                            debug!("Processing color conversion");
+                                            let hex_split = cc.split("#");
+                                            let hex_vec: Vec<&str> = hex_split.collect();
+                                            let hex = hex_vec[1].to_string();
+
+                                            let rgb2 = match Rgb::from_hex_str(
+                                                format!("#{}", hex).as_str(),
+                                            ) {
+                                                Ok(rgb) => rgb,
+                                                Err(_) => {
+                                                    error!("Error parsing hex color: {}", hex);
+                                                    continue;
+                                                }
+                                            };
+                                            // Rgb { r: 255.0, g: 204.0, b: 0.0 }
+
+                                            debug!("RGB values: {:?}", rgb2);
+
+                                            let red_int =
+                                                match parse_i64_safe(&rgb2.get_red().to_string()) {
+                                                    Ok(r) => r,
+                                                    Err(e) => {
+                                                        error!("Error parsing red from hex: {}", e);
+                                                        continue;
+                                                    }
+                                                };
+                                            let red_float: f32 = (red_int) as f32;
+
+                                            let green_int =
+                                                match parse_i64_safe(&rgb2.get_green().to_string())
+                                                {
+                                                    Ok(g) => g,
+                                                    Err(e) => {
+                                                        error!(
+                                                            "Error parsing green from hex: {}",
+                                                            e
+                                                        );
+                                                        continue;
+                                                    }
+                                                };
+                                            let green_float: f32 = (green_int) as f32;
+
+                                            let blue_int = match parse_i64_safe(
+                                                &rgb2.get_blue().to_string(),
+                                            ) {
+                                                Ok(b) => b,
+                                                Err(e) => {
+                                                    error!("Error parsing blue from hex: {}", e);
+                                                    continue;
+                                                }
+                                            };
+                                            let blue_float: f32 = (blue_int) as f32;
+
+                                            debug!("red_float: {:?}", red_float);
+                                            debug!("green_float: {:?}", green_float);
+                                            debug!("blue_float: {:?}", blue_float);
+
+                                            let rgb = Srgb::new(
+                                                red_float / 255.0,
+                                                green_float / 255.0,
+                                                blue_float / 255.0,
+                                            );
+                                            let hcc: Hsv = rgb.into_color();
+
+                                            debug!("HSV values: {:?}", hcc);
+
+                                            // Convert HSV to LIFX HSBK format (16-bit values)
+                                            let hbsk_set = HSBK {
+                                                hue: ((hcc.hue.into_positive_degrees()
+                                                    * LIFX_HUE_DEGREE_FACTOR)
+                                                    as u32
+                                                    % 0x10000)
+                                                    as u16,
+                                                saturation: (hcc.saturation * LIFX_SATURATION_MAX)
+                                                    as u16,
+                                                brightness: brightness,
+                                                kelvin: kelvin,
+                                            };
+
+                                            debug!("HBSK values: {:?}", hbsk_set);
+
+                                            bulb.set_color(&mgr.sock, hbsk_set, duration);
+                                        }
+                                    }
+                                }
+
+                                // Brightness
+                                if input.brightness.is_some() {
+                                    let brightness = match input.brightness {
+                                        Some(b) => b,
+                                        None => {
+                                            return Response::text(
+                                                json!({
+                                                    "error": "Missing brightness value"
+                                                })
+                                                .to_string(),
+                                            )
+                                            .with_status_code(400);
+                                        }
+                                    };
+
+                                    for bulb in &bulbs_vec {
+                                        let mut kelvin = 6500;
+                                        let mut saturation = 0;
+                                        let mut hue = 0;
+
+                                        let mut duration = 0;
+                                        if input.duration.is_some() {
+                                            duration = input.duration.unwrap_or(0.0) as u32;
+                                        }
+
+                                        if bulb.lifx_color.is_some() {
+                                            let lifxc = bulb.lifx_color.as_ref().unwrap();
+                                            kelvin = lifxc.kelvin;
+                                            saturation = lifxc.saturation;
+                                            hue = lifxc.hue;
+                                        }
+
+                                        let new_brightness_float =
+                                            match parse_f64_safe(&brightness.to_string()) {
+                                                Ok(b) => b,
+                                                Err(e) => {
+                                                    error!("Error parsing brightness: {}", e);
+                                                    continue;
+                                                }
+                                            };
+                                        let new_brightness: u16 = (LIFX_BRIGHTNESS_MAX
+                                            * new_brightness_float as f32)
+                                            as u16;
+                                        let hbsk_set = HSBK {
+                                            hue: hue,
+                                            saturation: saturation,
+                                            brightness: new_brightness,
+                                            kelvin: kelvin,
+                                        };
+                                        bulb.set_color(&mgr.sock, hbsk_set, duration);
+                                    }
+                                }
+
+                                // Infrared
+                                if input.infrared.is_some() {
+                                    let infrared_val = match input.infrared {
+                                        Some(i) => i,
+                                        None => {
+                                            return Response::text(
+                                                json!({
+                                                    "error": "Missing infrared value"
+                                                })
+                                                .to_string(),
+                                            )
+                                            .with_status_code(400);
+                                        }
+                                    };
+                                    let new_brightness: u16 =
+                                        (LIFX_BRIGHTNESS_MAX * infrared_val as f32) as u16;
+
+                                    for bulb in &bulbs_vec {
+                                        bulb.set_infrared(&mgr.sock, new_brightness);
+                                    }
+                                }
+
+                                // Return results in proper format
+                                #[derive(Serialize)]
+                                struct SingleStateResult {
+                                    id: String,
+                                    label: String,
+                                    status: String,
+                                }
+
+                                #[derive(Serialize)]
+                                struct SingleStateResponse {
+                                    results: Vec<SingleStateResult>,
+                                }
+
+                                let mut results = Vec::new();
+                                for bulb in &bulbs_vec {
+                                    results.push(SingleStateResult {
+                                        id: bulb.id.clone(),
+                                        label: bulb.label.clone(),
+                                        status: "ok".to_string(),
+                                    });
+                                }
+
+                                response = Response::json(&SingleStateResponse { results });
+                            }
+
+                            // ListLights
+                            // https://api.lifx.com/v1/lights/:selector
+                            if request.url().contains("/v1/lights/")
+                                && !request.url().contains("/state")
+                                && !request.url().contains("/effects")
+                                && !request.url().contains("/cycle")
+                                && !request.url().contains("/clean")
+                            {
+                                response = Response::json(&bulbs_vec.clone());
+                            }
+
+                            // Effects API endpoints
+                            // POST /v1/lights/:selector/effects/pulse
+                            if request.url().contains("/effects/pulse")
+                                && request.method() == "POST"
+                            {
+                                let body = try_or_400!(rouille::input::plain_text_body(request));
+                                let input: EffectRequest = try_or_400!(serde_json::from_str(&body));
+
+                                let handler = EffectsHandler::new();
+                                let effects_response = handler.handle_pulse(mgr, &bulbs_vec, input);
+                                response = Response::json(&effects_response);
+                            }
+
+                            // POST /v1/lights/:selector/effects/breathe
+                            if request.url().contains("/effects/breathe")
+                                && request.method() == "POST"
+                            {
+                                let body = try_or_400!(rouille::input::plain_text_body(request));
+                                let input: EffectRequest = try_or_400!(serde_json::from_str(&body));
+
+                                let handler = EffectsHandler::new();
+                                let effects_response =
+                                    handler.handle_breathe(mgr, &bulbs_vec, input);
+                                response = Response::json(&effects_response);
+                            }
+
+                            // POST /v1/lights/:selector/effects/strobe
+                            if request.url().contains("/effects/strobe")
+                                && request.method() == "POST"
+                            {
+                                let body = try_or_400!(rouille::input::plain_text_body(request));
+                                let input: EffectRequest = try_or_400!(serde_json::from_str(&body));
+
+                                let handler = EffectsHandler::new();
+                                let effects_response =
+                                    handler.handle_strobe(mgr, &bulbs_vec, input);
+                                response = Response::json(&effects_response);
+                            }
+
+                            // Cycle API endpoint
+                            // POST /v1/lights/:selector/cycle
+                            if request.url().contains("/cycle") && request.method() == "POST" {
+                                let body = try_or_400!(rouille::input::plain_text_body(request));
+                                let input: CycleRequest = try_or_400!(serde_json::from_str(&body));
+
+                                let handler = CycleHandler::new();
+                                let cycle_response = handler.handle_cycle(mgr, &bulbs_vec, input);
+                                response = Response::json(&cycle_response);
+                            }
+
+                            // Clean API endpoint
+                            // POST /v1/lights/:selector/clean
+                            if request.url().contains("/clean") && request.method() == "POST" {
+                                let body = try_or_400!(rouille::input::plain_text_body(request));
+                                let input: CleanRequest = try_or_400!(serde_json::from_str(&body));
+
+                                let handler = CleanHandler::new();
+                                let clean_response = handler.handle_clean(mgr, &bulbs_vec, input);
+                                response = Response::json(&clean_response);
+                            }
+                        } // Close the else block here
+
+                        // Mutex locks will be automatically dropped when they go out of scope
+
+                        return response;
+                    },
+                );
             });
-
-
-        },
+        }
         Err(e) => {
             error!("Server error: {:?}", e);
         }
     }
-
-
-
-
-
-
-
-
-
-
 }
 
 #[cfg(test)]
@@ -1642,9 +1828,9 @@ mod tests {
         let source = 0x12345678;
         let target = 0xABCDEF123456;
         let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 100)), 56700);
-        
+
         let bulb = BulbInfo::new(source, target, addr);
-        
+
         assert_eq!(bulb.source, source);
         assert_eq!(bulb.target, target);
         assert_eq!(bulb.addr, addr);
@@ -1663,26 +1849,24 @@ mod tests {
         let target = 0xABCDEF123456;
         let addr1 = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 100)), 56700);
         let addr2 = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 101)), 56700);
-        
+
         let mut bulb = BulbInfo::new(source, target, addr1);
         let initial_last_seen = bulb.last_seen;
-        
+
         // Sleep briefly to ensure time difference
         std::thread::sleep(Duration::from_millis(10));
-        
+
         bulb.update(addr2);
-        
+
         assert_eq!(bulb.addr, addr2);
         assert!(bulb.last_seen > initial_last_seen);
     }
 
     #[test]
     fn test_refreshable_data_empty() {
-        let data: RefreshableData<String> = RefreshableData::empty(
-            Duration::from_secs(60),
-            Message::GetLabel
-        );
-        
+        let data: RefreshableData<String> =
+            RefreshableData::empty(Duration::from_secs(60), Message::GetLabel);
+
         assert!(data.data.is_none());
         assert!(data.needs_refresh());
         assert!(data.as_ref().is_none());
@@ -1690,13 +1874,11 @@ mod tests {
 
     #[test]
     fn test_refreshable_data_update() {
-        let mut data: RefreshableData<String> = RefreshableData::empty(
-            Duration::from_secs(60),
-            Message::GetLabel
-        );
-        
+        let mut data: RefreshableData<String> =
+            RefreshableData::empty(Duration::from_secs(60), Message::GetLabel);
+
         data.update("Test Label".to_string());
-        
+
         assert!(data.data.is_some());
         assert!(!data.needs_refresh());
         assert_eq!(data.as_ref().unwrap(), "Test Label");
@@ -1704,14 +1886,12 @@ mod tests {
 
     #[test]
     fn test_refreshable_data_expiration() {
-        let mut data: RefreshableData<String> = RefreshableData::empty(
-            Duration::from_millis(10),
-            Message::GetLabel
-        );
-        
+        let mut data: RefreshableData<String> =
+            RefreshableData::empty(Duration::from_millis(10), Message::GetLabel);
+
         data.update("Test Label".to_string());
         assert!(!data.needs_refresh());
-        
+
         // Wait for expiration
         std::thread::sleep(Duration::from_millis(15));
         assert!(data.needs_refresh());
@@ -1725,7 +1905,7 @@ mod tests {
             kelvin: 3500,
             brightness: 32768,
         };
-        
+
         assert_eq!(color.hue, HUE_CYAN);
         assert_eq!(color.saturation, LIFX_SATURATION_MAX as u16);
         assert_eq!(color.kelvin, 3500);
@@ -1738,7 +1918,7 @@ mod tests {
             id: "group123".to_string(),
             name: "Living Room".to_string(),
         };
-        
+
         assert_eq!(group.id, "group123");
         assert_eq!(group.name, "Living Room");
     }
@@ -1749,7 +1929,7 @@ mod tests {
             id: "loc456".to_string(),
             name: "Home".to_string(),
         };
-        
+
         assert_eq!(location.id, "loc456");
         assert_eq!(location.name, "Home");
     }
@@ -1760,7 +1940,7 @@ mod tests {
             secret_key: "test_secret".to_string(),
             port: 8080,
         };
-        
+
         assert_eq!(config.secret_key, "test_secret");
         assert_eq!(config.port, 8080);
     }
@@ -1769,10 +1949,11 @@ mod tests {
     fn convert_rgb_to_hsbk(red: f32, green: f32, blue: f32) -> (u16, u16) {
         let rgb = Srgb::new(red / 255.0, green / 255.0, blue / 255.0);
         let hcc: Hsv = rgb.into_color();
-        
-        let hue = ((hcc.hue.into_positive_degrees() * LIFX_HUE_DEGREE_FACTOR) as u32 % 0x10000) as u16;
+
+        let hue =
+            ((hcc.hue.into_positive_degrees() * LIFX_HUE_DEGREE_FACTOR) as u32 % 0x10000) as u16;
         let saturation = (hcc.saturation * LIFX_SATURATION_MAX) as u16;
-        
+
         (hue, saturation)
     }
 
@@ -1853,9 +2034,9 @@ mod tests {
         let source = 0x12345678;
         let target = 0xABCDEF123456;
         let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 100)), 56700);
-        
+
         let bulb = BulbInfo::new(source, target, addr);
-        
+
         // Test that methods handle None values gracefully
         assert!(bulb.lifx_group.is_none());
         assert!(bulb.lifx_location.is_none());
@@ -1868,15 +2049,15 @@ mod tests {
     fn test_rate_limiter_basic() {
         let limiter = RateLimiter::new();
         let client_ip = "192.168.1.1".to_string();
-        
+
         // First attempt should succeed
         assert!(limiter.check_and_update(client_ip.clone()));
-        
+
         // Subsequent attempts within limit should succeed
         for _ in 1..MAX_AUTH_ATTEMPTS {
             assert!(limiter.check_and_update(client_ip.clone()));
         }
-        
+
         // Exceeding limit should fail
         assert!(!limiter.check_and_update(client_ip.clone()));
     }
@@ -1885,15 +2066,15 @@ mod tests {
     fn test_rate_limiter_window_reset() {
         let limiter = RateLimiter::new();
         let client_ip = "192.168.1.2".to_string();
-        
+
         // Fill up the attempts
         for _ in 0..MAX_AUTH_ATTEMPTS {
             assert!(limiter.check_and_update(client_ip.clone()));
         }
-        
+
         // Should be blocked now
         assert!(!limiter.check_and_update(client_ip.clone()));
-        
+
         // Simulate waiting for window to expire
         // Note: In a real test, we'd need to mock time or use a configurable duration
         // For now, we'll test with a different IP
@@ -1904,7 +2085,7 @@ mod tests {
     #[test]
     fn test_rate_limiter_different_ips() {
         let limiter = RateLimiter::new();
-        
+
         // Different IPs should have independent limits
         for i in 0..10 {
             let ip = format!("192.168.1.{}", i);
@@ -1915,16 +2096,16 @@ mod tests {
     #[test]
     fn test_rate_limiter_cleanup() {
         let limiter = RateLimiter::new();
-        
+
         // Add some entries
         for i in 0..5 {
             let ip = format!("192.168.1.{}", i);
             limiter.check_and_update(ip);
         }
-        
+
         // Cleanup should not affect recent entries
         limiter.cleanup_old_entries();
-        
+
         // Recent entries should still be tracked
         let test_ip = "192.168.1.0".to_string();
         for _ in 1..MAX_AUTH_ATTEMPTS {
@@ -1941,7 +2122,7 @@ mod tests {
             AuthResult::Unauthorized(_) => assert!(true),
             AuthResult::Authorized => assert!(false, "Should be unauthorized"),
         }
-        
+
         let auth = AuthResult::Authorized;
         match auth {
             AuthResult::Authorized => assert!(true),
@@ -2007,23 +2188,23 @@ mod tests {
     #[test]
     fn test_lifx_hue_conversion_boundaries() {
         // Test boundary conditions for hue conversion
-        
+
         // 0 degrees should map to 0
         let hue_0 = ((0.0 * LIFX_HUE_DEGREE_FACTOR) as u32 % 0x10000) as u16;
         assert_eq!(hue_0, 0);
-        
+
         // 360 degrees should wrap to 0
         let hue_360 = ((360.0 * LIFX_HUE_DEGREE_FACTOR) as u32 % 0x10000) as u16;
         assert_eq!(hue_360, 0);
-        
+
         // 180 degrees should map to 32768 (half of 65536)
         let hue_180 = ((180.0 * LIFX_HUE_DEGREE_FACTOR) as u32 % 0x10000) as u16;
         assert_eq!(hue_180, 32768);
-        
+
         // 90 degrees should map to 16384 (quarter of 65536)
         let hue_90 = ((90.0 * LIFX_HUE_DEGREE_FACTOR) as u32 % 0x10000) as u16;
         assert_eq!(hue_90, 16384);
-        
+
         // 270 degrees should map to 49152 (three quarters of 65536)
         let hue_270 = ((270.0 * LIFX_HUE_DEGREE_FACTOR) as u32 % 0x10000) as u16;
         assert_eq!(hue_270, 49152);
@@ -2032,26 +2213,26 @@ mod tests {
     #[test]
     fn test_lifx_saturation_brightness_conversion() {
         // Test saturation and brightness conversions
-        
+
         // Full saturation (1.0) should map to 65535
         let full_sat = (1.0 * LIFX_SATURATION_MAX) as u16;
         assert_eq!(full_sat, 65535);
-        
+
         // Half saturation (0.5) should map to 32767.5 (rounded to 32768)
         let half_sat = (0.5 * LIFX_SATURATION_MAX) as u16;
         assert!((half_sat as i32 - 32768).abs() <= 1);
-        
+
         // No saturation (0.0) should map to 0
         let no_sat = (0.0 * LIFX_SATURATION_MAX) as u16;
         assert_eq!(no_sat, 0);
-        
+
         // Same for brightness
         let full_bright = (1.0 * LIFX_BRIGHTNESS_MAX) as u16;
         assert_eq!(full_bright, 65535);
-        
+
         let half_bright = (0.5 * LIFX_BRIGHTNESS_MAX) as u16;
         assert!((half_bright as i32 - 32768).abs() <= 1);
-        
+
         let no_bright = (0.0 * LIFX_BRIGHTNESS_MAX) as u16;
         assert_eq!(no_bright, 0);
     }
@@ -2059,33 +2240,33 @@ mod tests {
     #[test]
     fn test_named_color_constants() {
         // Verify that our named color constants match expected degree values
-        
+
         assert_eq!(HUE_RED, 0);
-        
+
         // Orange ~39 degrees
         let expected_orange = ((39.0 * LIFX_HUE_DEGREE_FACTOR) as u32 % 0x10000) as u16;
         assert!((HUE_ORANGE as i32 - expected_orange as i32).abs() < 10);
-        
+
         // Yellow 60 degrees
         let expected_yellow = ((60.0 * LIFX_HUE_DEGREE_FACTOR) as u32 % 0x10000) as u16;
         assert!((HUE_YELLOW as i32 - expected_yellow as i32).abs() < 10);
-        
+
         // Green 120 degrees
         let expected_green = ((120.0 * LIFX_HUE_DEGREE_FACTOR) as u32 % 0x10000) as u16;
         assert!((HUE_GREEN as i32 - expected_green as i32).abs() < 10);
-        
+
         // Cyan 180 degrees
         let expected_cyan = ((180.0 * LIFX_HUE_DEGREE_FACTOR) as u32 % 0x10000) as u16;
         assert_eq!(HUE_CYAN, expected_cyan);
-        
+
         // Blue 240 degrees
         let expected_blue = ((240.0 * LIFX_HUE_DEGREE_FACTOR) as u32 % 0x10000) as u16;
         assert!((HUE_BLUE as i32 - expected_blue as i32).abs() < 10);
-        
+
         // Purple ~275 degrees
         let expected_purple = ((275.0 * LIFX_HUE_DEGREE_FACTOR) as u32 % 0x10000) as u16;
         assert!((HUE_PURPLE as i32 - expected_purple as i32).abs() < 10);
-        
+
         // Pink ~350 degrees
         let expected_pink = ((350.0 * LIFX_HUE_DEGREE_FACTOR) as u32 % 0x10000) as u16;
         assert!((HUE_PINK as i32 - expected_pink as i32).abs() < 10);
@@ -2093,34 +2274,38 @@ mod tests {
 
     #[test]
     fn test_network_error_recovery_simulation() {
-        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
         use std::net::UdpSocket;
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
         use std::thread;
         use std::time::Duration;
-        
+
         let error_count = Arc::new(AtomicUsize::new(0));
         let should_stop = Arc::new(AtomicBool::new(false));
-        
+
         let error_count_clone = error_count.clone();
         let should_stop_clone = should_stop.clone();
-        
+
         let handle = thread::spawn(move || {
             let socket = UdpSocket::bind("127.0.0.1:0").expect("Failed to bind socket");
-            socket.set_read_timeout(Some(Duration::from_millis(100))).unwrap();
-            
+            socket
+                .set_read_timeout(Some(Duration::from_millis(100)))
+                .unwrap();
+
             let mut buf = [0; 1024];
             let mut consecutive_errors = 0;
-            
+
             while !should_stop_clone.load(Ordering::Relaxed) {
                 match socket.recv_from(&mut buf) {
                     Ok(_) => {
                         consecutive_errors = 0;
                     }
-                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock || 
-                              e.kind() == std::io::ErrorKind::TimedOut => {
+                    Err(e)
+                        if e.kind() == std::io::ErrorKind::WouldBlock
+                            || e.kind() == std::io::ErrorKind::TimedOut =>
+                    {
                         consecutive_errors += 1;
                         error_count_clone.fetch_add(1, Ordering::Relaxed);
-                        
+
                         if consecutive_errors > 3 {
                             thread::sleep(Duration::from_millis(100));
                         }
@@ -2132,72 +2317,78 @@ mod tests {
                 }
             }
         });
-        
+
         thread::sleep(Duration::from_millis(500));
         should_stop.store(true, Ordering::Relaxed);
         handle.join().unwrap();
-        
-        assert!(error_count.load(Ordering::Relaxed) > 0, "Should have encountered timeout errors");
+
+        assert!(
+            error_count.load(Ordering::Relaxed) > 0,
+            "Should have encountered timeout errors"
+        );
     }
-    
+
     // Mutex error handling tests
     #[test]
     fn test_rate_limiter_mutex_poisoning_simulation() {
+        use std::panic;
         use std::sync::{Arc, Mutex};
         use std::thread;
-        use std::panic;
-        
+
         let limiter = Arc::new(RateLimiter::new());
         let limiter_clone = Arc::clone(&limiter);
-        
+
         // Spawn a thread that will panic while holding the mutex
         let handle = thread::spawn(move || {
             let _guard = limiter_clone.attempts.lock().unwrap();
             panic!("Simulating panic with mutex held");
         });
-        
+
         // Wait for the panic to occur
         let _ = handle.join();
-        
+
         // Now the mutex is poisoned - test that check_and_update handles it
         let result = limiter.check_and_update("192.168.1.1".to_string());
         // Should return false when mutex is poisoned
         assert!(!result, "Should deny access when mutex is poisoned");
     }
-    
+
     #[test]
     fn test_rate_limiter_cleanup_with_poisoned_mutex() {
+        use std::panic;
         use std::sync::{Arc, Mutex};
         use std::thread;
-        use std::panic;
-        
+
         let limiter = Arc::new(RateLimiter::new());
         let limiter_clone = Arc::clone(&limiter);
-        
+
         // Spawn a thread that will panic while holding the mutex
         let handle = thread::spawn(move || {
             let _guard = limiter_clone.attempts.lock().unwrap();
             panic!("Simulating panic with mutex held");
         });
-        
+
         // Wait for the panic to occur
         let _ = handle.join();
-        
+
         // Now the mutex is poisoned - test that cleanup_old_entries handles it gracefully
         // This should not panic, just return early
         limiter.cleanup_old_entries();
         // If we reach here without panic, the test passes
-        assert!(true, "cleanup_old_entries should handle poisoned mutex gracefully");
+        assert!(
+            true,
+            "cleanup_old_entries should handle poisoned mutex gracefully"
+        );
     }
-    
+
     #[test]
     fn test_manager_bulbs_mutex_error_handling() {
-        use std::sync::{Arc, Mutex};
         use std::collections::HashMap;
-        
+        use std::sync::{Arc, Mutex};
+
         // Create a Manager-like structure for testing
         let bulbs: Arc<Mutex<HashMap<u64, BulbInfo>>> = Arc::new(Mutex::new(HashMap::new()));
-        
+
         // Test that we can handle mutex errors properly
         match bulbs.lock() {
             Ok(_) => assert!(true, "Normal mutex acquisition should succeed"),
@@ -2207,16 +2398,16 @@ mod tests {
             }
         };
     }
-    
+
     #[test]
     fn test_concurrent_mutex_access_safety() {
         use std::sync::{Arc, Mutex};
         use std::thread;
         use std::time::Duration;
-        
+
         let limiter = Arc::new(RateLimiter::new());
         let mut handles = vec![];
-        
+
         // Spawn multiple threads accessing the mutex concurrently
         for i in 0..10 {
             let limiter_clone = Arc::clone(&limiter);
@@ -2229,12 +2420,12 @@ mod tests {
             });
             handles.push(handle);
         }
-        
+
         // Wait for all threads to complete
         for handle in handles {
             handle.join().unwrap();
         }
-        
+
         // If we reach here without deadlock or panic, the test passes
         assert!(true, "Concurrent mutex access should be safe");
     }
@@ -2243,15 +2434,14 @@ mod tests {
     fn test_exponential_backoff_calculation() {
         let base_delay = Duration::from_millis(100);
         let max_delay = Duration::from_secs(30);
-        
+
         // Test the actual implementation logic used in the worker function
         // consecutive_errors starts at 1 and uses saturating_sub(1)
         for consecutive_errors in 1..10 {
-            let backoff_multiplier = 2_u32.saturating_pow((consecutive_errors as u32).saturating_sub(1));
-            let delay = base_delay
-                .saturating_mul(backoff_multiplier)
-                .min(max_delay);
-            
+            let backoff_multiplier =
+                2_u32.saturating_pow((consecutive_errors as u32).saturating_sub(1));
+            let delay = base_delay.saturating_mul(backoff_multiplier).min(max_delay);
+
             if consecutive_errors == 1 {
                 assert_eq!(delay, Duration::from_millis(100)); // 2^0 * 100ms = 100ms
             } else if consecutive_errors == 2 {
@@ -2272,65 +2462,67 @@ mod tests {
                 assert_eq!(delay, Duration::from_millis(25600)); // 2^8 * 100ms = 25600ms
             }
         }
-        
+
         // Test that very high error counts still cap at max_delay
         let high_error_count: u32 = 20;
         let backoff_multiplier = 2_u32.saturating_pow(high_error_count.saturating_sub(1));
-        let delay = base_delay
-            .saturating_mul(backoff_multiplier)
-            .min(max_delay);
+        let delay = base_delay.saturating_mul(backoff_multiplier).min(max_delay);
         assert_eq!(delay, max_delay);
     }
-    
+
     #[test]
     fn test_network_socket_with_interruption() {
         use std::net::UdpSocket;
         use std::thread;
         use std::time::Duration;
-        
+
         let server = UdpSocket::bind("127.0.0.1:0").expect("Failed to bind server");
         let server_addr = server.local_addr().unwrap();
-        server.set_read_timeout(Some(Duration::from_millis(100))).unwrap();
-        
+        server
+            .set_read_timeout(Some(Duration::from_millis(100)))
+            .unwrap();
+
         let client = UdpSocket::bind("127.0.0.1:0").expect("Failed to bind client");
-        
+
         let handle = thread::spawn(move || {
             let mut buf = [0; 1024];
             let mut received_count = 0;
             let mut error_count = 0;
-            
+
             for _ in 0..10 {
                 match server.recv_from(&mut buf) {
                     Ok((nbytes, _)) if nbytes > 0 => {
                         received_count += 1;
                     }
-                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock || 
-                              e.kind() == std::io::ErrorKind::TimedOut => {
+                    Err(e)
+                        if e.kind() == std::io::ErrorKind::WouldBlock
+                            || e.kind() == std::io::ErrorKind::TimedOut =>
+                    {
                         error_count += 1;
                     }
                     _ => {}
                 }
             }
-            
+
             (received_count, error_count)
         });
-        
+
         thread::sleep(Duration::from_millis(50));
         client.send_to(b"test1", server_addr).unwrap();
         thread::sleep(Duration::from_millis(150));
         client.send_to(b"test2", server_addr).unwrap();
         thread::sleep(Duration::from_millis(200));
         client.send_to(b"test3", server_addr).unwrap();
-        
+
         let (received, errors) = handle.join().unwrap();
         assert!(received >= 2, "Should have received at least 2 messages");
         assert!(errors >= 2, "Should have encountered timeout errors");
     }
-    
+
     #[test]
     fn test_error_handling_different_error_types() {
         use std::io::{Error, ErrorKind};
-        
+
         let error_types = vec![
             ErrorKind::WouldBlock,
             ErrorKind::TimedOut,
@@ -2341,10 +2533,10 @@ mod tests {
             ErrorKind::AddrNotAvailable,
             ErrorKind::BrokenPipe,
         ];
-        
+
         for error_kind in error_types {
             let error = Error::new(error_kind, "Test error");
-            
+
             match error.kind() {
                 ErrorKind::WouldBlock | ErrorKind::TimedOut => {
                     assert!(true, "Should handle timeout/wouldblock");

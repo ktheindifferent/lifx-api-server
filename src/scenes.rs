@@ -1,9 +1,9 @@
+use crate::{BulbInfo, LifxColor, Manager};
+use lifx_rs::lan::HSBK;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
-use serde::{Deserialize, Serialize};
-use lifx_rs::lan::HSBK;
-use crate::{BulbInfo, Manager, LifxColor};
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct Scene {
@@ -82,7 +82,7 @@ impl ScenesHandler {
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_secs();
-        
+
         let scene = Scene {
             uuid: uuid.clone(),
             name: request.name,
@@ -90,18 +90,20 @@ impl ScenesHandler {
             created_at: now,
             updated_at: now,
         };
-        
+
         let mut scenes = self.scenes.lock().unwrap();
         scenes.insert(uuid, scene.clone());
-        
+
         SceneResponse { scene }
     }
 
     pub fn list_scenes(&self) -> ScenesListResponse {
         let scenes = self.scenes.lock().unwrap();
         let scenes_list: Vec<Scene> = scenes.values().cloned().collect();
-        
-        ScenesListResponse { scenes: scenes_list }
+
+        ScenesListResponse {
+            scenes: scenes_list,
+        }
     }
 
     pub fn get_scene(&self, uuid: &str) -> Option<Scene> {
@@ -120,35 +122,40 @@ impl ScenesHandler {
         uuid: &str,
         request: ActivateSceneRequest,
     ) -> Result<ActivateSceneResponse, String> {
-        let scene = self.get_scene(uuid)
+        let scene = self
+            .get_scene(uuid)
             .ok_or_else(|| format!("Scene {} not found", uuid))?;
-        
+
         let duration = (request.duration.unwrap_or(1.0) * 1000.0) as u32;
         let mut results = Vec::new();
-        
+
         let bulbs = mgr.bulbs.lock().unwrap();
-        
+
         for state in &scene.states {
             let matching_bulbs = self.filter_bulbs_by_selector(&bulbs, &state.selector);
-            
+
             for bulb in matching_bulbs {
                 let result = self.apply_scene_state(mgr, bulb, state, duration);
-                
+
                 results.push(ActivateResult {
                     id: bulb.id.clone(),
                     label: bulb.label.clone(),
-                    status: if result.is_ok() { "ok".to_string() } else { "error".to_string() },
+                    status: if result.is_ok() {
+                        "ok".to_string()
+                    } else {
+                        "error".to_string()
+                    },
                 });
             }
         }
-        
+
         Ok(ActivateSceneResponse { results })
     }
 
     pub fn capture_current_state(&self, mgr: &Manager, name: String) -> SceneResponse {
         let bulbs = mgr.bulbs.lock().unwrap();
         let mut states = Vec::new();
-        
+
         for bulb in bulbs.values() {
             let state = SceneState {
                 selector: format!("id:{}", bulb.id),
@@ -164,7 +171,7 @@ impl ScenesHandler {
             };
             states.push(state);
         }
-        
+
         let request = CreateSceneRequest { name, states };
         self.create_scene(request)
     }
@@ -182,11 +189,11 @@ impl ScenesHandler {
             } else {
                 lifx_rs::lan::PowerLevel::Standby
             };
-            
+
             bulb.set_power(&mgr.sock, power_level)
                 .map_err(|e| format!("Failed to set power: {:?}", e))?;
         }
-        
+
         if let Some(ref color) = state.color {
             let hsbk = HSBK {
                 hue: color.hue,
@@ -194,7 +201,7 @@ impl ScenesHandler {
                 brightness: color.brightness,
                 kelvin: color.kelvin,
             };
-            
+
             bulb.set_color(&mgr.sock, hsbk, duration)
                 .map_err(|e| format!("Failed to set color: {:?}", e))?;
         } else if state.brightness.is_some() || state.kelvin.is_some() {
@@ -202,19 +209,21 @@ impl ScenesHandler {
             let hsbk = HSBK {
                 hue: current.map_or(0, |c| c.hue),
                 saturation: current.map_or(0, |c| c.saturation),
-                brightness: state.brightness
+                brightness: state
+                    .brightness
                     .map(|b| (b * 65535.0) as u16)
                     .or_else(|| current.map(|c| c.brightness))
                     .unwrap_or(65535),
-                kelvin: state.kelvin
+                kelvin: state
+                    .kelvin
                     .or_else(|| current.map(|c| c.kelvin))
                     .unwrap_or(3500),
             };
-            
+
             bulb.set_color(&mgr.sock, hsbk, duration)
                 .map_err(|e| format!("Failed to set color: {:?}", e))?;
         }
-        
+
         Ok(())
     }
 
@@ -224,56 +233,65 @@ impl ScenesHandler {
         selector: &str,
     ) -> Vec<&'a BulbInfo> {
         let mut filtered = Vec::new();
-        
+
         for bulb in bulbs.values() {
             let matches = match selector {
                 "all" => true,
                 s if s.starts_with("id:") => {
                     let id = s.strip_prefix("id:").unwrap_or("");
                     bulb.id.contains(id)
-                },
+                }
                 s if s.starts_with("group_id:") => {
                     let group_id = s.strip_prefix("group_id:").unwrap_or("");
-                    bulb.lifx_group.as_ref().map_or(false, |g| g.id.contains(group_id))
-                },
+                    bulb.lifx_group
+                        .as_ref()
+                        .map_or(false, |g| g.id.contains(group_id))
+                }
                 s if s.starts_with("group:") => {
                     let group_name = s.strip_prefix("group:").unwrap_or("");
-                    bulb.lifx_group.as_ref().map_or(false, |g| g.name.contains(group_name))
-                },
+                    bulb.lifx_group
+                        .as_ref()
+                        .map_or(false, |g| g.name.contains(group_name))
+                }
                 s if s.starts_with("location_id:") => {
                     let location_id = s.strip_prefix("location_id:").unwrap_or("");
-                    bulb.lifx_location.as_ref().map_or(false, |l| l.id.contains(location_id))
-                },
+                    bulb.lifx_location
+                        .as_ref()
+                        .map_or(false, |l| l.id.contains(location_id))
+                }
                 s if s.starts_with("location:") => {
                     let location_name = s.strip_prefix("location:").unwrap_or("");
-                    bulb.lifx_location.as_ref().map_or(false, |l| l.name.contains(location_name))
-                },
+                    bulb.lifx_location
+                        .as_ref()
+                        .map_or(false, |l| l.name.contains(location_name))
+                }
                 s if s.starts_with("label:") => {
                     let label = s.strip_prefix("label:").unwrap_or("");
                     bulb.label.contains(label)
-                },
+                }
                 _ => false,
             };
-            
+
             if matches {
                 filtered.push(bulb);
             }
         }
-        
+
         filtered
     }
 
     fn generate_uuid(&self) -> String {
-        use rand::{thread_rng, Rng};
         use rand::distributions::Alphanumeric;
-        
+        use rand::{thread_rng, Rng};
+
         let uuid: String = thread_rng()
             .sample_iter(&Alphanumeric)
             .take(32)
             .map(char::from)
             .collect();
-        
-        format!("{}-{}-{}-{}-{}",
+
+        format!(
+            "{}-{}-{}-{}-{}",
             &uuid[0..8],
             &uuid[8..12],
             &uuid[12..16],
@@ -292,39 +310,37 @@ impl Default for ScenesHandler {
 #[cfg(test)]
 mod tests {
     use super::*;
-    
+
     #[test]
     fn test_scene_creation() {
         let handler = ScenesHandler::new();
-        
+
         let request = CreateSceneRequest {
             name: "Test Scene".to_string(),
-            states: vec![
-                SceneState {
-                    selector: "all".to_string(),
-                    power: Some("on".to_string()),
-                    color: Some(SceneColor {
-                        hue: 32768,
-                        saturation: 65535,
-                        brightness: 32768,
-                        kelvin: 3500,
-                    }),
-                    brightness: Some(0.5),
-                    kelvin: Some(3500),
-                }
-            ],
+            states: vec![SceneState {
+                selector: "all".to_string(),
+                power: Some("on".to_string()),
+                color: Some(SceneColor {
+                    hue: 32768,
+                    saturation: 65535,
+                    brightness: 32768,
+                    kelvin: 3500,
+                }),
+                brightness: Some(0.5),
+                kelvin: Some(3500),
+            }],
         };
-        
+
         let response = handler.create_scene(request);
         assert_eq!(response.scene.name, "Test Scene");
         assert_eq!(response.scene.states.len(), 1);
         assert!(response.scene.uuid.len() > 0);
     }
-    
+
     #[test]
     fn test_scene_list() {
         let handler = ScenesHandler::new();
-        
+
         // Create multiple scenes
         for i in 0..3 {
             let request = CreateSceneRequest {
@@ -333,50 +349,50 @@ mod tests {
             };
             handler.create_scene(request);
         }
-        
+
         let list = handler.list_scenes();
         assert_eq!(list.scenes.len(), 3);
     }
-    
+
     #[test]
     fn test_scene_get_and_delete() {
         let handler = ScenesHandler::new();
-        
+
         let request = CreateSceneRequest {
             name: "Test Scene".to_string(),
             states: vec![],
         };
-        
+
         let response = handler.create_scene(request);
         let uuid = response.scene.uuid.clone();
-        
+
         // Test get
         let scene = handler.get_scene(&uuid);
         assert!(scene.is_some());
         assert_eq!(scene.unwrap().name, "Test Scene");
-        
+
         // Test delete
         assert!(handler.delete_scene(&uuid));
         assert!(handler.get_scene(&uuid).is_none());
         assert!(!handler.delete_scene(&uuid)); // Should return false for non-existent
     }
-    
+
     #[test]
     fn test_uuid_generation() {
         let handler = ScenesHandler::new();
-        
+
         let uuid1 = handler.generate_uuid();
         let uuid2 = handler.generate_uuid();
-        
+
         // UUIDs should be unique
         assert_ne!(uuid1, uuid2);
-        
+
         // UUID should have correct format
         assert!(uuid1.contains('-'));
         let parts: Vec<&str> = uuid1.split('-').collect();
         assert_eq!(parts.len(), 5);
     }
-    
+
     #[test]
     fn test_scene_state_creation() {
         let state = SceneState {
@@ -391,7 +407,7 @@ mod tests {
             brightness: Some(1.0),
             kelvin: Some(6500),
         };
-        
+
         assert_eq!(state.selector, "id:123");
         assert_eq!(state.power.unwrap(), "on");
         assert_eq!(state.brightness.unwrap(), 1.0);
