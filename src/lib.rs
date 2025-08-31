@@ -28,6 +28,11 @@ use palette::{Hsv, Srgb, IntoColor};
 
 use colors_transform::{Rgb, Color};
 
+pub mod error;
+
+#[cfg(test)]
+mod error_tests;
+
 pub mod set_states;
 use set_states::{SetStatesHandler, StatesRequest};
 
@@ -988,8 +993,10 @@ pub fn start(config: Config) {
                     // Scenes API endpoints (handle before selector-based endpoints)
                     // GET /v1/scenes
                     if request.url() == "/v1/scenes" && request.method() == "GET" {
-                        let scenes_response = scenes_handler.list_scenes();
-                        return Response::json(&scenes_response);
+                        match scenes_handler.list_scenes() {
+                            Ok(scenes_response) => return Response::json(&scenes_response),
+                            Err(e) => return Response::text(json!({ "error": e.to_string() }).to_string()).with_status_code(500),
+                        }
                     }
                     
                     // POST /v1/scenes
@@ -997,8 +1004,10 @@ pub fn start(config: Config) {
                         let body = try_or_400!(rouille::input::plain_text_body(request));
                         let input: CreateSceneRequest = try_or_400!(serde_json::from_str(&body));
                         
-                        let scene_response = scenes_handler.create_scene(input);
-                        return Response::json(&scene_response);
+                        match scenes_handler.create_scene(input) {
+                            Ok(scene_response) => return Response::json(&scene_response),
+                            Err(e) => return Response::text(json!({ "error": e.to_string() }).to_string()).with_status_code(500),
+                        }
                     }
                     
                     // PUT /v1/scenes/:uuid/activate
@@ -1016,7 +1025,7 @@ pub fn start(config: Config) {
                             
                             match scenes_handler.activate_scene(mgr, uuid, input) {
                                 Ok(activate_response) => return Response::json(&activate_response),
-                                Err(e) => return Response::text(json!({ "error": e }).to_string()).with_status_code(404),
+                                Err(e) => return Response::text(json!({ "error": e.to_string() }).to_string()).with_status_code(404),
                             }
                         }
                     }
@@ -1027,7 +1036,7 @@ pub fn start(config: Config) {
                         let url_parts: Vec<&str> = url_string.split('/').collect();
                         if url_parts.len() >= 4 {
                             let uuid = url_parts[3];
-                            if scenes_handler.delete_scene(uuid) {
+                            if scenes_handler.delete_scene(uuid).unwrap_or(false) {
                                 return Response::text(json!({ "status": "deleted" }).to_string());
                             } else {
                                 return Response::text(json!({ "error": "Scene not found" }).to_string()).with_status_code(404);
@@ -1044,8 +1053,10 @@ pub fn start(config: Config) {
                             .unwrap_or("Captured Scene")
                             .to_string();
                         
-                        let scene_response = scenes_handler.capture_current_state(mgr, name);
-                        return Response::json(&scene_response);
+                        match scenes_handler.capture_current_state(mgr, name) {
+                            Ok(scene_response) => return Response::json(&scene_response),
+                            Err(e) => return Response::text(json!({ "error": e.to_string() }).to_string()).with_status_code(500),
+                        }
                     }
                     
                     // (PUT) SetStates
@@ -1490,8 +1501,7 @@ pub fn start(config: Config) {
                                     duration = input.duration.unwrap_or(0.0) as u32;
                                 }
         
-                                if bulb.lifx_color.is_some() {
-                                    let lifxc = bulb.lifx_color.as_ref().unwrap();
+                                if let Some(lifxc) = bulb.lifx_color.as_ref() {
                                     kelvin = lifxc.kelvin;
                                     saturation = lifxc.saturation;
                                     hue = lifxc.hue;

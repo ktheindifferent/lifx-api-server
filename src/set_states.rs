@@ -618,7 +618,8 @@ impl SetStatesHandler {
         
         // Apply brightness independently if no color was specified
         if state.color.is_none() && state.brightness.is_some() {
-            let brightness_val = state.brightness.unwrap();
+            let brightness_val = state.brightness.ok_or_else(|| 
+                format!("Brightness value expected but not found"))?;
             let duration = state.duration.unwrap_or(0.0) as u32;
             
             let current_color = bulb.lifx_color.as_ref();

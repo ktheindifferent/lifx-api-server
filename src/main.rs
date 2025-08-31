@@ -4,7 +4,7 @@ use log::{info, warn, error};
 use rand::{thread_rng, Rng};
 use rand::distributions::Alphanumeric;
 
-fn main() {
+fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Initialize logger with environment variable control
     env_logger::init();
 
@@ -98,6 +98,6 @@ fn main() {
     info!("Server started, entering main loop");
 
     loop {
-        
+        std::thread::sleep(std::time::Duration::from_secs(1));
     }
 }
