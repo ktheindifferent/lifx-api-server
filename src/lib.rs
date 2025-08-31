@@ -43,6 +43,9 @@ use cycle::{CycleHandler, CycleRequest};
 pub mod clean;
 use clean::{CleanHandler, CleanRequest};
 
+pub mod mutex_utils;
+use mutex_utils::{safe_lock, safe_lock_monitored, safe_lock_with_recovery};
+
 
 
 const HOUR: Duration = Duration::from_secs(60 * 60);

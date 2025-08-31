@@ -3,6 +3,10 @@ use std::thread;
 use std::time::{Duration, Instant};
 use std::collections::HashMap;
 
+// Import the safe mutex utilities from the library
+extern crate lifx_api_server;
+use lifx_api_server::mutex_utils::{safe_lock, safe_lock_monitored, safe_lock_with_recovery};
+
 #[test]
 fn test_concurrent_bulb_updates_stress() {
     // Simulate concurrent access to bulbs mutex
@@ -10,7 +14,7 @@ fn test_concurrent_bulb_updates_stress() {
     
     // Initialize with some test data
     {
-        let mut bulbs_guard = bulbs.lock().unwrap();
+        let mut bulbs_guard = safe_lock(&bulbs).expect("Failed to initialize test data");
         for i in 0..10 {
             bulbs_guard.insert(i, format!("Bulb_{}", i));
         }
@@ -75,7 +79,7 @@ fn test_concurrent_bulb_updates_stress() {
     println!("Concurrent stress test completed in {:?}", elapsed);
     
     // Verify final state
-    let final_bulbs = bulbs.lock().unwrap();
+    let final_bulbs = safe_lock(&bulbs).expect("Failed to get final state");
     assert!(final_bulbs.len() >= 10, "Should have at least initial bulbs");
     assert!(elapsed < Duration::from_secs(5), "Should complete within reasonable time");
 }
@@ -276,7 +280,7 @@ fn test_deadlock_prevention() {
     assert!(elapsed < Duration::from_secs(2), "Should complete without deadlock");
     
     // Verify final state
-    let val1 = *mutex1.lock().unwrap();
-    let val2 = *mutex2.lock().unwrap();
+    let val1 = *safe_lock(&mutex1).expect("Failed to lock mutex1");
+    let val2 = *safe_lock(&mutex2).expect("Failed to lock mutex2");
     println!("Final values: mutex1={}, mutex2={}", val1, val2);
 }
